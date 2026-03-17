@@ -30,16 +30,12 @@ export class LiveSessionManager {
   private player: AudioPlayer;
   private onMessageCallback: ((msg: Message) => void) | null = null;
   private onStatusCallback: ((status: string) => void) | null = null;
-  private isMuted: boolean = false;
 
   constructor() {
-    // Vite injeta VITE_GEMINI_API_KEY ou GEMINI_API_KEY no build via define
     const apiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY
-      || process.env.GEMINI_API_KEY
+      || (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY)
       || '';
-    if (!apiKey) {
-      console.error('GEMINI_API_KEY nao encontrada. Configure VITE_GEMINI_API_KEY no Render.');
-    }
+    if (!apiKey) console.error('GEMINI_API_KEY nao encontrada. Configure VITE_GEMINI_API_KEY.');
     this.ai = new GoogleGenAI({ apiKey });
     this.recorder = new AudioRecorder();
     this.player = new AudioPlayer();
@@ -50,35 +46,15 @@ export class LiveSessionManager {
     this.onStatusCallback = onStatus;
   }
 
-  setMuted(muted: boolean) {
-    this.isMuted = muted;
-    this.player.setAudioMuted(muted);
-  }
-
-  setMicMuted(muted: boolean) {
-    this.recorder.setMicMuted(muted);
-  }
-
-  getMicMuted(): boolean {
-    return this.recorder.getMicMuted();
-  }
-
-  setAudioOutputMuted(muted: boolean) {
-    this.player.setAudioMuted(muted);
-  }
-
-  getAudioOutputMuted(): boolean {
-    return this.player.getAudioMuted();
-  }
-
-  isMicActive(): boolean {
-    return this.recorder.isActive();
-  }
+  setMuted(muted: boolean) { this.player.setAudioMuted(muted); }
+  setMicMuted(muted: boolean) { this.recorder.setMicMuted(muted); }
+  getMicMuted(): boolean { return this.recorder.getMicMuted(); }
+  setAudioOutputMuted(muted: boolean) { this.player.setAudioMuted(muted); }
+  getAudioOutputMuted(): boolean { return this.player.getAudioMuted(); }
+  isMicActive(): boolean { return this.recorder.isActive(); }
 
   async connect(config: LiveConfig) {
     if (this.session) await this.disconnect();
-
-    this.isMuted = !config.playAudio;
     this.player.setAudioMuted(!config.playAudio);
     this.onStatusCallback?.('Connecting...');
 
@@ -87,7 +63,7 @@ export class LiveSessionManager {
       if (config.functionCalling) tools.push({ functionDeclarations: modularTools });
       if (config.grounding) tools.push({ googleSearch: {} });
 
-      const sessionPromise = this.ai.live.connect({
+      this.session = await this.ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
@@ -109,10 +85,9 @@ export class LiveSessionManager {
           onopen: () => {
             this.onStatusCallback?.('Connected');
             this.recorder.start((base64Data) => {
-              sessionPromise.then((session) => {
-                session.sendRealtimeInput({
-                  media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
-                });
+              // Agora this.session ja esta resolvido (nao e mais uma Promise)
+              this.session?.sendRealtimeInput({
+                media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
               });
             });
           },
@@ -125,74 +100,61 @@ export class LiveSessionManager {
               for (const part of parts) {
                 if (part.text) {
                   this.onMessageCallback?.({
-                    id: Date.now().toString(),
-                    role: 'model',
-                    text: part.text,
-                    isThinking: true
+                    id: Date.now().toString(), role: 'model', text: part.text, isThinking: true
                   });
                 }
               }
             }
 
-            const outputTranscriptionText = (message.serverContent as any)?.outputTranscription?.text;
-            if (outputTranscriptionText) {
+            const outputTranscription = (message.serverContent as any)?.outputTranscription?.text;
+            if (outputTranscription) {
               this.onMessageCallback?.({
-                id: Date.now().toString(),
-                role: 'model',
-                text: outputTranscriptionText,
-                isThinking: false
+                id: Date.now().toString(), role: 'model', text: outputTranscription, isThinking: false
               });
             }
 
-            const inputTranscriptionText = (message.serverContent as any)?.inputTranscription?.text;
-            if (inputTranscriptionText) {
-              this.onMessageCallback?.({ id: Date.now().toString(), role: 'user', text: inputTranscriptionText });
+            const inputTranscription = (message.serverContent as any)?.inputTranscription?.text;
+            if (inputTranscription) {
+              this.onMessageCallback?.({ id: Date.now().toString(), role: 'user', text: inputTranscription });
             }
 
             if (message.serverContent?.interrupted) this.player.stop();
 
             const functionCalls = message.toolCall?.functionCalls;
-            if (functionCalls && functionCalls.length > 0) {
+            if (functionCalls?.length) {
               this.onStatusCallback?.('Using tools...');
               const responses = await Promise.all(
                 functionCalls.map(async (call) => {
                   this.onMessageCallback?.({
-                    id: call.id,
-                    role: 'system',
+                    id: call.id, role: 'system',
                     text: `🔧 Calling tool: **${call.name}**`,
-                    isToolCall: true,
-                    toolDetails: { args: call.args }
+                    isToolCall: true, toolDetails: { args: call.args }
                   });
                   const result = await handleToolCall(call.name, call.args);
                   this.onMessageCallback?.({
-                    id: call.id + '_result',
-                    role: 'system',
+                    id: call.id + '_result', role: 'system',
                     text: `🔧 Tool **${call.name}** completed.`,
-                    isToolCall: true,
-                    toolDetails: { args: call.args, result }
+                    isToolCall: true, toolDetails: { args: call.args, result }
                   });
                   return { id: call.id, name: call.name, response: result };
                 })
               );
-              sessionPromise.then((session) => {
-                session.sendToolResponse({ functionResponses: responses });
-              });
+              this.session?.sendToolResponse({ functionResponses: responses });
               this.onStatusCallback?.('Connected');
             }
           },
-          onerror: (error) => {
+          onerror: (error: any) => {
             console.error('Live API Error:', error);
             this.onStatusCallback?.('Error');
             this.disconnect();
           },
           onclose: () => {
             this.onStatusCallback?.('Disconnected');
-            this.disconnect();
+            this.recorder.stop();
+            this.session = null;
           },
         },
       });
-
-      this.session = await sessionPromise;
     } catch (error) {
       console.error('Failed to connect:', error);
       this.onStatusCallback?.('Connection Failed');
@@ -202,11 +164,10 @@ export class LiveSessionManager {
   async sendText(text: string) {
     if (!this.session) return;
     try {
-      await this.session.send({
-        clientContent: {
-          turns: [{ role: 'user', parts: [{ text }] }],
-          turnComplete: true,
-        },
+      // Metodo correto da SDK JS: sendClientContent (nao session.send)
+      this.session.sendClientContent({
+        turns: [{ role: 'user', parts: [{ text }] }],
+        turnComplete: true,
       });
       this.onMessageCallback?.({ id: Date.now().toString(), role: 'user', text });
     } catch (error) {
@@ -217,9 +178,7 @@ export class LiveSessionManager {
   async disconnect() {
     this.recorder.stop();
     this.player.stop();
-    if (this.session) {
-      try { this.session = null; } catch (e) { console.error(e); }
-    }
+    this.session = null;
     this.onStatusCallback?.('Disconnected');
   }
 }
