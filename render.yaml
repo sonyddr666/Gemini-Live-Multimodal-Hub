@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: gemini-live-hub
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build && npx tsc server.ts --module es2022 --moduleResolution bundler --esModuleInterop true --outDir . --skipLibCheck true
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: GEMINI_API_KEY
+        sync: false  # voce preenche no dashboard do Render
+      - key: NODE_ENV
+        value: production

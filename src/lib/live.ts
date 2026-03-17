@@ -23,8 +23,21 @@ export type Message = {
   isThinking?: boolean;
 };
 
+// Busca a API key do servidor em runtime (nao fica no bundle)
+async function getApiKey(): Promise<string> {
+  // Em dev local, ainda pode usar .env via import.meta.env
+  const devKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
+  if (devKey) return devKey;
+
+  const res = await fetch('/api/config');
+  if (!res.ok) throw new Error('Nao foi possivel obter a API key do servidor');
+  const data = await res.json();
+  if (!data.apiKey) throw new Error('API key ausente na resposta do servidor');
+  return data.apiKey;
+}
+
 export class LiveSessionManager {
-  private ai: GoogleGenAI;
+  private ai: GoogleGenAI | null = null;
   private session: any = null;
   private recorder: AudioRecorder;
   private player: AudioPlayer;
@@ -32,8 +45,7 @@ export class LiveSessionManager {
   private onStatusCallback: ((status: string) => void) | null = null;
   private isMuted: boolean = false;
 
-  constructor(apiKey: string) {
-    this.ai = new GoogleGenAI({ apiKey });
+  constructor() {
     this.recorder = new AudioRecorder();
     this.player = new AudioPlayer();
   }
@@ -43,13 +55,11 @@ export class LiveSessionManager {
     this.onStatusCallback = onStatus;
   }
 
-  // Mute do audio de saida (PlayAudio toggle)
   setMuted(muted: boolean) {
     this.isMuted = muted;
     this.player.setAudioMuted(muted);
   }
 
-  // Mute do microfone (entrada) sem parar o stream
   setMicMuted(muted: boolean) {
     this.recorder.setMicMuted(muted);
   }
@@ -58,7 +68,6 @@ export class LiveSessionManager {
     return this.recorder.getMicMuted();
   }
 
-  // Mute do audio de saida via GainNode (independente do isMuted legacy)
   setAudioOutputMuted(muted: boolean) {
     this.player.setAudioMuted(muted);
   }
@@ -72,22 +81,19 @@ export class LiveSessionManager {
   }
 
   async connect(config: LiveConfig) {
-    if (this.session) {
-      await this.disconnect();
-    }
+    if (this.session) await this.disconnect();
 
     this.isMuted = !config.playAudio;
     this.player.setAudioMuted(!config.playAudio);
     this.onStatusCallback?.('Connecting...');
 
     try {
+      const apiKey = await getApiKey();
+      this.ai = new GoogleGenAI({ apiKey });
+
       const tools: any[] = [];
-      if (config.functionCalling) {
-        tools.push({ functionDeclarations: modularTools });
-      }
-      if (config.grounding) {
-        tools.push({ googleSearch: {} });
-      }
+      if (config.functionCalling) tools.push({ functionDeclarations: modularTools });
+      if (config.grounding) tools.push({ googleSearch: {} });
 
       const sessionPromise = this.ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
@@ -102,7 +108,7 @@ export class LiveSessionManager {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: config.voice } },
           },
-          systemInstruction: config.systemInstruction || config.sessionContext || 'You are a helpful, multimodal AI assistant. You can use tools to answer questions and perform tasks.',
+          systemInstruction: config.systemInstruction || config.sessionContext || 'You are a helpful, multimodal AI assistant.',
           tools: tools.length > 0 ? tools : undefined,
           outputAudioTranscription: {},
           inputAudioTranscription: {},
@@ -119,13 +125,9 @@ export class LiveSessionManager {
             });
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Audio de saida
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio) {
-              this.player.play(base64Audio); // gain node ja controla o mute
-            }
+            if (base64Audio) this.player.play(base64Audio);
 
-            // Pensamentos (modelTurn parts com thought:true ou texto intermediario)
             const parts = message.serverContent?.modelTurn?.parts;
             if (parts) {
               for (const part of parts) {
@@ -140,7 +142,6 @@ export class LiveSessionManager {
               }
             }
 
-            // Transcricao do audio de saida (fala final do Gemini)
             const outputTranscriptionText = (message.serverContent as any)?.outputTranscription?.text;
             if (outputTranscriptionText) {
               this.onMessageCallback?.({
@@ -151,18 +152,13 @@ export class LiveSessionManager {
               });
             }
 
-            // Transcricao do audio de entrada (voz do usuario)
             const inputTranscriptionText = (message.serverContent as any)?.inputTranscription?.text;
             if (inputTranscriptionText) {
               this.onMessageCallback?.({ id: Date.now().toString(), role: 'user', text: inputTranscriptionText });
             }
 
-            // Interrupcao
-            if (message.serverContent?.interrupted) {
-              this.player.stop();
-            }
+            if (message.serverContent?.interrupted) this.player.stop();
 
-            // Tool calls
             const functionCalls = message.toolCall?.functionCalls;
             if (functionCalls && functionCalls.length > 0) {
               this.onStatusCallback?.('Using tools...');
@@ -175,9 +171,7 @@ export class LiveSessionManager {
                     isToolCall: true,
                     toolDetails: { args: call.args }
                   });
-
                   const result = await handleToolCall(call.name, call.args);
-
                   this.onMessageCallback?.({
                     id: call.id + '_result',
                     role: 'system',
@@ -185,15 +179,9 @@ export class LiveSessionManager {
                     isToolCall: true,
                     toolDetails: { args: call.args, result }
                   });
-
-                  return {
-                    id: call.id,
-                    name: call.name,
-                    response: result,
-                  };
+                  return { id: call.id, name: call.name, response: result };
                 })
               );
-
               sessionPromise.then((session) => {
                 session.sendToolResponse({ functionResponses: responses });
               });
@@ -238,11 +226,7 @@ export class LiveSessionManager {
     this.recorder.stop();
     this.player.stop();
     if (this.session) {
-      try {
-        this.session = null;
-      } catch (e) {
-        console.error(e);
-      }
+      try { this.session = null; } catch (e) { console.error(e); }
     }
     this.onStatusCallback?.('Disconnected');
   }
