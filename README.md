@@ -2,19 +2,35 @@
 <img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Run and deploy your AI Studio app
+# Gemini Live Hub
 
-This contains everything you need to run your app locally.
+Chat de voz em tempo real com o Gemini via Gemini Live API.
 
-View your app in AI Studio: https://ai.studio/apps/6318c9c5-c076-45a4-8f4d-8dc4fac98264
+## Deploy no Render (1 clique)
 
-## Run Locally
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/sonyddr666/Gemini-Live-Multimodal-Hub)
 
-**Prerequisites:**  Node.js
+> Ao clicar, o Render vai pedir só uma coisa:
+> **`VITE_GEMINI_API_KEY`** — cole sua chave do [Google AI Studio](https://aistudio.google.com/apikey) e clique em Apply.
 
+---
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Rodar localmente
+
+**Pré-requisito:** Node.js 18+
+
+```bash
+npm install
+```
+
+Crie o arquivo `.env.local`:
+
+```env
+VITE_GEMINI_API_KEY=sua_chave_aqui
+```
+
+```bash
+npm run dev
+```
+
+Abra http://localhost:3000
