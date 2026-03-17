@@ -32,7 +32,14 @@ export class LiveSessionManager {
   private onStatusCallback: ((status: string) => void) | null = null;
   private isMuted: boolean = false;
 
-  constructor(apiKey: string) {
+  constructor() {
+    // Vite injeta VITE_GEMINI_API_KEY ou GEMINI_API_KEY no build via define
+    const apiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY
+      || process.env.GEMINI_API_KEY
+      || '';
+    if (!apiKey) {
+      console.error('GEMINI_API_KEY nao encontrada. Configure VITE_GEMINI_API_KEY no Render.');
+    }
     this.ai = new GoogleGenAI({ apiKey });
     this.recorder = new AudioRecorder();
     this.player = new AudioPlayer();
@@ -45,39 +52,55 @@ export class LiveSessionManager {
 
   setMuted(muted: boolean) {
     this.isMuted = muted;
+    this.player.setAudioMuted(muted);
+  }
+
+  setMicMuted(muted: boolean) {
+    this.recorder.setMicMuted(muted);
+  }
+
+  getMicMuted(): boolean {
+    return this.recorder.getMicMuted();
+  }
+
+  setAudioOutputMuted(muted: boolean) {
+    this.player.setAudioMuted(muted);
+  }
+
+  getAudioOutputMuted(): boolean {
+    return this.player.getAudioMuted();
+  }
+
+  isMicActive(): boolean {
+    return this.recorder.isActive();
   }
 
   async connect(config: LiveConfig) {
-    if (this.session) {
-      await this.disconnect();
-    }
+    if (this.session) await this.disconnect();
 
     this.isMuted = !config.playAudio;
+    this.player.setAudioMuted(!config.playAudio);
     this.onStatusCallback?.('Connecting...');
 
     try {
       const tools: any[] = [];
-      if (config.functionCalling) {
-        tools.push({ functionDeclarations: modularTools });
-      }
-      if (config.grounding) {
-        tools.push({ googleSearch: {} });
-      }
+      if (config.functionCalling) tools.push({ functionDeclarations: modularTools });
+      if (config.grounding) tools.push({ googleSearch: {} });
 
       const sessionPromise = this.ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
-          mediaResolution: config.mediaResolution === 'High' 
-            ? MediaResolution.MEDIA_RESOLUTION_HIGH 
+          mediaResolution: config.mediaResolution === 'High'
+            ? MediaResolution.MEDIA_RESOLUTION_HIGH
             : MediaResolution.MEDIA_RESOLUTION_MEDIUM,
-          realtimeInputConfig: config.turnCoverage 
-            ? { turnCoverage: TurnCoverage.TURN_INCLUDES_ALL_INPUT } 
+          realtimeInputConfig: config.turnCoverage
+            ? { turnCoverage: TurnCoverage.TURN_INCLUDES_ALL_INPUT }
             : undefined,
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: config.voice } },
           },
-          systemInstruction: config.systemInstruction || config.sessionContext || 'You are a helpful, multimodal AI assistant. You can use tools to answer questions and perform tasks.',
+          systemInstruction: config.systemInstruction || config.sessionContext || 'You are a helpful, multimodal AI assistant.',
           tools: tools.length > 0 ? tools : undefined,
           outputAudioTranscription: {},
           inputAudioTranscription: {},
@@ -94,21 +117,16 @@ export class LiveSessionManager {
             });
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle audio output
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio && !this.isMuted) {
-              this.player.play(base64Audio);
-            }
+            if (base64Audio) this.player.play(base64Audio);
 
-            // Handle model turn text (thoughts and intermediate text)
             const parts = message.serverContent?.modelTurn?.parts;
             if (parts) {
               for (const part of parts) {
                 if (part.text) {
-                  // All text from modelTurn goes to the THINKING button
-                  this.onMessageCallback?.({ 
-                    id: Date.now().toString(), 
-                    role: 'model', 
+                  this.onMessageCallback?.({
+                    id: Date.now().toString(),
+                    role: 'model',
                     text: part.text,
                     isThinking: true
                   });
@@ -116,29 +134,23 @@ export class LiveSessionManager {
               }
             }
 
-            // Handle output transcription (final spoken text)
             const outputTranscriptionText = (message.serverContent as any)?.outputTranscription?.text;
             if (outputTranscriptionText) {
-              this.onMessageCallback?.({ 
-                id: Date.now().toString(), 
-                role: 'model', 
+              this.onMessageCallback?.({
+                id: Date.now().toString(),
+                role: 'model',
                 text: outputTranscriptionText,
                 isThinking: false
               });
             }
 
-            // Handle user input transcription
             const inputTranscriptionText = (message.serverContent as any)?.inputTranscription?.text;
             if (inputTranscriptionText) {
               this.onMessageCallback?.({ id: Date.now().toString(), role: 'user', text: inputTranscriptionText });
             }
 
-            // Handle interruption
-            if (message.serverContent?.interrupted) {
-              this.player.stop();
-            }
+            if (message.serverContent?.interrupted) this.player.stop();
 
-            // Handle tool calls
             const functionCalls = message.toolCall?.functionCalls;
             if (functionCalls && functionCalls.length > 0) {
               this.onStatusCallback?.('Using tools...');
@@ -151,9 +163,7 @@ export class LiveSessionManager {
                     isToolCall: true,
                     toolDetails: { args: call.args }
                   });
-                  
                   const result = await handleToolCall(call.name, call.args);
-                  
                   this.onMessageCallback?.({
                     id: call.id + '_result',
                     role: 'system',
@@ -161,15 +171,9 @@ export class LiveSessionManager {
                     isToolCall: true,
                     toolDetails: { args: call.args, result }
                   });
-
-                  return {
-                    id: call.id,
-                    name: call.name,
-                    response: result,
-                  };
+                  return { id: call.id, name: call.name, response: result };
                 })
               );
-
               sessionPromise.then((session) => {
                 session.sendToolResponse({ functionResponses: responses });
               });
@@ -197,17 +201,10 @@ export class LiveSessionManager {
 
   async sendText(text: string) {
     if (!this.session) return;
-    
-    // The Live API allows sending text via clientContent
     try {
       await this.session.send({
         clientContent: {
-          turns: [
-            {
-              role: 'user',
-              parts: [{ text }],
-            },
-          ],
+          turns: [{ role: 'user', parts: [{ text }] }],
           turnComplete: true,
         },
       });
@@ -221,12 +218,7 @@ export class LiveSessionManager {
     this.recorder.stop();
     this.player.stop();
     if (this.session) {
-      try {
-        // Close session if possible
-        this.session = null;
-      } catch (e) {
-        console.error(e);
-      }
+      try { this.session = null; } catch (e) { console.error(e); }
     }
     this.onStatusCallback?.('Disconnected');
   }
