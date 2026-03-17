@@ -1,0 +1,176 @@
+@import "tailwindcss";
+
+/* ════════════════════════════════════════════════
+   SCROLLBARS — fina e dark global
+════════════════════════════════════════════════ */
+* {
+    scrollbar-width: thin;
+    scrollbar-color: #2a2a3a transparent;
+}
+*::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+}
+*::-webkit-scrollbar-track {
+    background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+    background: #2a2a3a;
+    border-radius: 99px;
+    transition: background 0.2s;
+}
+*::-webkit-scrollbar-thumb:hover {
+    background: #7c5cfc;
+}
+
+/* Sidebar — scroll invisível mas funcional */
+.config-panel {
+    overflow-y: auto;
+    scrollbar-width: none;
+}
+.config-panel::-webkit-scrollbar {
+    display: none;
+}
+
+
+/* ════════════════════════════════════════════════
+   RANGE SLIDER — Thinking budget
+════════════════════════════════════════════════ */
+input[type="range"] {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 3px;
+    border-radius: 99px;
+    background: #2a2a3a;
+    outline: none;
+    cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #7c5cfc;
+    box-shadow: 0 0 8px rgba(124, 92, 252, 0.6);
+    cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s;
+}
+input[type="range"]::-webkit-slider-thumb:hover {
+    transform: scale(1.2);
+    box-shadow: 0 0 14px rgba(124, 92, 252, 0.8);
+}
+input[type="range"]::-moz-range-thumb {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #7c5cfc;
+    border: none;
+    box-shadow: 0 0 8px rgba(124, 92, 252, 0.6);
+    cursor: pointer;
+}
+/* Preenche a track até o thumb com roxo */
+input[type="range"]::-webkit-slider-runnable-track {
+    background: linear-gradient(
+        to right,
+        #7c5cfc calc(var(--range-progress, 0%) ),
+        #2a2a3a calc(var(--range-progress, 0%) )
+    );
+    height: 3px;
+    border-radius: 99px;
+}
+
+
+/* ════════════════════════════════════════════════
+   RADIO BUTTONS — Instructions
+════════════════════════════════════════════════ */
+input[type="radio"] {
+    accent-color: #7c5cfc;
+    width: 16px;
+    height: 16px;
+    cursor: pointer;
+}
+
+
+/* ════════════════════════════════════════════════
+   TOGGLES (checkbox switch)
+════════════════════════════════════════════════ */
+input[type="checkbox"] {
+    accent-color: #7c5cfc;
+    width: 18px;
+    height: 18px;
+    cursor: pointer;
+}
+
+
+/* ════════════════════════════════════════════════
+   CHEVRONS — seções colapsáveis
+   Troca o ▼▲ por um SVG rotacionado com transition
+════════════════════════════════════════════════ */
+.section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    padding: 14px 16px;
+    user-select: none;
+    border-bottom: 1px solid #2a2a3a;
+    transition: background 0.15s;
+}
+.section-header:hover {
+    background: rgba(124, 92, 252, 0.06);
+}
+.section-header .chevron {
+    width: 16px;
+    height: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.25s ease;
+    color: #8888a0;
+}
+/* Quando a seção está aberta, rotaciona o chevron */
+details[open] > .section-header .chevron,
+details.open   > .section-header .chevron {
+    transform: rotate(180deg);
+    color: #7c5cfc;
+}
+
+/* ════════════════════════════════════════════════
+   SEÇÃO ATIVA — borda esquerda roxa
+════════════════════════════════════════════════ */
+details[open] > .section-header,
+details.open  > .section-header {
+    border-left: 2px solid #7c5cfc;
+    padding-left: 14px; /* compensa os 2px da borda */
+}
+
+
+/* ════════════════════════════════════════════════
+   ESTADO VAZIO — "Nenhuma sessão salva."
+════════════════════════════════════════════════ */
+.empty-state {
+    text-align: center;
+    color: #8888a0;
+    font-size: 0.78rem;
+    padding: 16px 0;
+    font-style: italic;
+}
+
+
+/* ════════════════════════════════════════════════
+   TELA DO CHAT — mensagem central fade
+════════════════════════════════════════════════ */
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+.chat-empty-hint {
+    animation: fadeIn 0.4s ease;
+    transition: opacity 0.3s;
+}
+.chat-empty-hint.hidden {
+    opacity: 0;
+    pointer-events: none;
+}

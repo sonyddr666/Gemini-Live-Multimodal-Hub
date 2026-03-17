@@ -1,0 +1,7 @@
+{
+  "name": "Gemini Live Multimodal Hub",
+  "description": "A powerful multimodal application using Gemini Live API with voice, text chat, and modular function calling capabilities.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
