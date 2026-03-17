@@ -23,21 +23,8 @@ export type Message = {
   isThinking?: boolean;
 };
 
-// Busca a API key do servidor em runtime (nao fica no bundle)
-async function getApiKey(): Promise<string> {
-  // Em dev local, ainda pode usar .env via import.meta.env
-  const devKey = (import.meta as any).env?.VITE_GEMINI_API_KEY;
-  if (devKey) return devKey;
-
-  const res = await fetch('/api/config');
-  if (!res.ok) throw new Error('Nao foi possivel obter a API key do servidor');
-  const data = await res.json();
-  if (!data.apiKey) throw new Error('API key ausente na resposta do servidor');
-  return data.apiKey;
-}
-
 export class LiveSessionManager {
-  private ai: GoogleGenAI | null = null;
+  private ai: GoogleGenAI;
   private session: any = null;
   private recorder: AudioRecorder;
   private player: AudioPlayer;
@@ -46,6 +33,14 @@ export class LiveSessionManager {
   private isMuted: boolean = false;
 
   constructor() {
+    // Vite injeta VITE_GEMINI_API_KEY ou GEMINI_API_KEY no build via define
+    const apiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY
+      || process.env.GEMINI_API_KEY
+      || '';
+    if (!apiKey) {
+      console.error('GEMINI_API_KEY nao encontrada. Configure VITE_GEMINI_API_KEY no Render.');
+    }
+    this.ai = new GoogleGenAI({ apiKey });
     this.recorder = new AudioRecorder();
     this.player = new AudioPlayer();
   }
@@ -88,9 +83,6 @@ export class LiveSessionManager {
     this.onStatusCallback?.('Connecting...');
 
     try {
-      const apiKey = await getApiKey();
-      this.ai = new GoogleGenAI({ apiKey });
-
       const tools: any[] = [];
       if (config.functionCalling) tools.push({ functionDeclarations: modularTools });
       if (config.grounding) tools.push({ googleSearch: {} });

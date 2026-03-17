@@ -5,8 +5,10 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  // NAO injetamos GEMINI_API_KEY no bundle.
-  // O frontend busca via /api/config em runtime.
+  define: {
+    // Render Static injeta env vars com prefixo VITE_ no build
+    'process.env.GEMINI_API_KEY': JSON.stringify(process.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || ''),
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, '.'),
@@ -20,12 +22,5 @@ export default defineConfig({
     port: 3000,
     host: '0.0.0.0',
     hmr: process.env.DISABLE_HMR !== 'true',
-    // Proxy para o /api/config funcionar no dev tb
-    proxy: {
-      '/api': {
-        target: 'http://localhost:3001',
-        changeOrigin: true,
-      },
-    },
   },
 });
