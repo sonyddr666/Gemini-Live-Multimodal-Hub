@@ -43,8 +43,32 @@ export class LiveSessionManager {
     this.onStatusCallback = onStatus;
   }
 
+  // Mute do audio de saida (PlayAudio toggle)
   setMuted(muted: boolean) {
     this.isMuted = muted;
+    this.player.setAudioMuted(muted);
+  }
+
+  // Mute do microfone (entrada) sem parar o stream
+  setMicMuted(muted: boolean) {
+    this.recorder.setMicMuted(muted);
+  }
+
+  getMicMuted(): boolean {
+    return this.recorder.getMicMuted();
+  }
+
+  // Mute do audio de saida via GainNode (independente do isMuted legacy)
+  setAudioOutputMuted(muted: boolean) {
+    this.player.setAudioMuted(muted);
+  }
+
+  getAudioOutputMuted(): boolean {
+    return this.player.getAudioMuted();
+  }
+
+  isMicActive(): boolean {
+    return this.recorder.isActive();
   }
 
   async connect(config: LiveConfig) {
@@ -53,6 +77,7 @@ export class LiveSessionManager {
     }
 
     this.isMuted = !config.playAudio;
+    this.player.setAudioMuted(!config.playAudio);
     this.onStatusCallback?.('Connecting...');
 
     try {
@@ -68,11 +93,11 @@ export class LiveSessionManager {
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
-          mediaResolution: config.mediaResolution === 'High' 
-            ? MediaResolution.MEDIA_RESOLUTION_HIGH 
+          mediaResolution: config.mediaResolution === 'High'
+            ? MediaResolution.MEDIA_RESOLUTION_HIGH
             : MediaResolution.MEDIA_RESOLUTION_MEDIUM,
-          realtimeInputConfig: config.turnCoverage 
-            ? { turnCoverage: TurnCoverage.TURN_INCLUDES_ALL_INPUT } 
+          realtimeInputConfig: config.turnCoverage
+            ? { turnCoverage: TurnCoverage.TURN_INCLUDES_ALL_INPUT }
             : undefined,
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: config.voice } },
@@ -94,21 +119,20 @@ export class LiveSessionManager {
             });
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Handle audio output
+            // Audio de saida
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio && !this.isMuted) {
-              this.player.play(base64Audio);
+            if (base64Audio) {
+              this.player.play(base64Audio); // gain node ja controla o mute
             }
 
-            // Handle model turn text (thoughts and intermediate text)
+            // Pensamentos (modelTurn parts com thought:true ou texto intermediario)
             const parts = message.serverContent?.modelTurn?.parts;
             if (parts) {
               for (const part of parts) {
                 if (part.text) {
-                  // All text from modelTurn goes to the THINKING button
-                  this.onMessageCallback?.({ 
-                    id: Date.now().toString(), 
-                    role: 'model', 
+                  this.onMessageCallback?.({
+                    id: Date.now().toString(),
+                    role: 'model',
                     text: part.text,
                     isThinking: true
                   });
@@ -116,29 +140,29 @@ export class LiveSessionManager {
               }
             }
 
-            // Handle output transcription (final spoken text)
+            // Transcricao do audio de saida (fala final do Gemini)
             const outputTranscriptionText = (message.serverContent as any)?.outputTranscription?.text;
             if (outputTranscriptionText) {
-              this.onMessageCallback?.({ 
-                id: Date.now().toString(), 
-                role: 'model', 
+              this.onMessageCallback?.({
+                id: Date.now().toString(),
+                role: 'model',
                 text: outputTranscriptionText,
                 isThinking: false
               });
             }
 
-            // Handle user input transcription
+            // Transcricao do audio de entrada (voz do usuario)
             const inputTranscriptionText = (message.serverContent as any)?.inputTranscription?.text;
             if (inputTranscriptionText) {
               this.onMessageCallback?.({ id: Date.now().toString(), role: 'user', text: inputTranscriptionText });
             }
 
-            // Handle interruption
+            // Interrupcao
             if (message.serverContent?.interrupted) {
               this.player.stop();
             }
 
-            // Handle tool calls
+            // Tool calls
             const functionCalls = message.toolCall?.functionCalls;
             if (functionCalls && functionCalls.length > 0) {
               this.onStatusCallback?.('Using tools...');
@@ -151,9 +175,9 @@ export class LiveSessionManager {
                     isToolCall: true,
                     toolDetails: { args: call.args }
                   });
-                  
+
                   const result = await handleToolCall(call.name, call.args);
-                  
+
                   this.onMessageCallback?.({
                     id: call.id + '_result',
                     role: 'system',
@@ -197,17 +221,10 @@ export class LiveSessionManager {
 
   async sendText(text: string) {
     if (!this.session) return;
-    
-    // The Live API allows sending text via clientContent
     try {
       await this.session.send({
         clientContent: {
-          turns: [
-            {
-              role: 'user',
-              parts: [{ text }],
-            },
-          ],
+          turns: [{ role: 'user', parts: [{ text }] }],
           turnComplete: true,
         },
       });
@@ -222,7 +239,6 @@ export class LiveSessionManager {
     this.player.stop();
     if (this.session) {
       try {
-        // Close session if possible
         this.session = null;
       } catch (e) {
         console.error(e);

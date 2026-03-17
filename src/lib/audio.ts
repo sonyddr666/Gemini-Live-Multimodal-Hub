@@ -4,6 +4,7 @@ export class AudioRecorder {
   private source: MediaStreamAudioSourceNode | null = null;
   private processor: ScriptProcessorNode | null = null;
   private onDataCallback: ((data: string) => void) | null = null;
+  private isMicMuted: boolean = false;
 
   async start(onData: (data: string) => void) {
     this.onDataCallback = onData;
@@ -14,6 +15,7 @@ export class AudioRecorder {
       this.processor = this.audioContext.createScriptProcessor(4096, 1, 1);
 
       this.processor.onaudioprocess = (e) => {
+        if (this.isMicMuted) return; // silencia sem parar o stream
         const inputData = e.inputBuffer.getChannelData(0);
         const pcm16 = this.floatTo16BitPCM(inputData);
         const base64 = this.arrayBufferToBase64(pcm16);
@@ -28,6 +30,22 @@ export class AudioRecorder {
       console.error('Error starting audio recorder:', error);
       throw error;
     }
+  }
+
+  setMicMuted(muted: boolean) {
+    this.isMicMuted = muted;
+    // Pausa o track do OS tambem para apagar o indicador de mic ativo
+    if (this.stream) {
+      this.stream.getAudioTracks().forEach(t => { t.enabled = !muted; });
+    }
+  }
+
+  getMicMuted(): boolean {
+    return this.isMicMuted;
+  }
+
+  isActive(): boolean {
+    return this.stream !== null;
   }
 
   stop() {
@@ -48,6 +66,7 @@ export class AudioRecorder {
       this.audioContext = null;
     }
     this.onDataCallback = null;
+    this.isMicMuted = false;
   }
 
   private floatTo16BitPCM(float32Array: Float32Array): ArrayBuffer {
@@ -75,13 +94,28 @@ export class AudioRecorder {
 export class AudioPlayer {
   private audioContext: AudioContext | null = null;
   private nextPlayTime: number = 0;
+  private gainNode: GainNode | null = null;
+  private isAudioMuted: boolean = false;
 
   constructor() {
     this.audioContext = new AudioContext({ sampleRate: 24000 });
+    this.gainNode = this.audioContext.createGain();
+    this.gainNode.connect(this.audioContext.destination);
+  }
+
+  setAudioMuted(muted: boolean) {
+    this.isAudioMuted = muted;
+    if (this.gainNode) {
+      this.gainNode.gain.setTargetAtTime(muted ? 0 : 1, this.audioContext!.currentTime, 0.01);
+    }
+  }
+
+  getAudioMuted(): boolean {
+    return this.isAudioMuted;
   }
 
   async play(base64Audio: string) {
-    if (!this.audioContext) return;
+    if (!this.audioContext || !this.gainNode) return;
 
     try {
       const arrayBuffer = this.base64ToArrayBuffer(base64Audio);
@@ -97,7 +131,7 @@ export class AudioPlayer {
 
       const source = this.audioContext.createBufferSource();
       source.buffer = audioBuffer;
-      source.connect(this.audioContext.destination);
+      source.connect(this.gainNode); // conecta no gain em vez de destination direto
 
       const currentTime = this.audioContext.currentTime;
       if (this.nextPlayTime < currentTime) {
@@ -115,6 +149,10 @@ export class AudioPlayer {
     if (this.audioContext) {
       this.audioContext.close();
       this.audioContext = new AudioContext({ sampleRate: 24000 });
+      this.gainNode = this.audioContext.createGain();
+      if (!this.isAudioMuted) this.gainNode.gain.value = 1;
+      else this.gainNode.gain.value = 0;
+      this.gainNode.connect(this.audioContext.destination);
       this.nextPlayTime = 0;
     }
   }
