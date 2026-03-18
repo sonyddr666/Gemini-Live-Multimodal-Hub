@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings, Mic, MicOff, Send, AudioLines, Sparkles, Cpu, Edit2, Trash2, Plus, Eye, Download, Volume2, VolumeX, AlertTriangle, RotateCcw, PhoneOff } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, AudioLines, Sparkles, Cpu, Edit2, Trash2, Plus, Eye, Download, Volume2, VolumeX, AlertTriangle, RotateCcw, PhoneOff, MessageSquare } from 'lucide-react';
 import { cn } from './lib/utils';
 import { LiveSessionManager, Message, DroppedSession } from './lib/live';
+import { ChatSessionManager, setTTSEnabled, setTTSRate, cancelTTS } from './lib/chat';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import ReactMarkdown from 'react-markdown';
 
@@ -9,6 +10,12 @@ const DROPPED_SESSION_KEY = 'livego_dropped_session';
 const ACTIVE_SESSION_KEY  = 'livego_active_session';
 const MIN_SESSION_MS      = 5000;
 const RECONNECT_COOLDOWN  = 3000;
+
+// Modelos native-audio → usa LiveSessionManager (WebSocket + voz nativa)
+// Qualquer outro → usa ChatSessionManager (REST + Chrome STT + speechSynthesis)
+function isLiveModel(model: string) {
+  return model.includes('native-audio');
+}
 
 interface Instruction {
   id: string;
@@ -25,6 +32,7 @@ interface SessionHistory {
   voice: string;
   messages: Message[];
   wasDropped?: boolean;
+  mode?: 'live' | 'text';
 }
 
 export default function App() {
@@ -48,11 +56,19 @@ function AppInner() {
   const [useConversationContext, setUseConversationContext] = useState(() => {
     return localStorage.getItem('livego_use_context') === 'true';
   });
+  const [ttsEnabled, setTtsEnabled] = useState(() =>
+    localStorage.getItem('livego_tts_enabled') !== 'false'
+  );
+  const [ttsRate, setTtsRate] = useState(() =>
+    parseFloat(localStorage.getItem('livego_tts_rate') || '1')
+  );
 
   const lastDisconnectRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
 
-  const [model, setModel] = useState('gemini-2.5-flash-native-audio-preview-12-2025');
+  const [model, setModel] = useState(
+    () => localStorage.getItem('livego_model') || 'gemini-2.5-flash-native-audio-preview-12-2025'
+  );
   const [voice, setVoice] = useState('Zephyr');
   const [mediaResolution, setMediaResolution] = useState('258 tokens / image');
   const [turnCoverage, setTurnCoverage] = useState(false);
@@ -86,7 +102,10 @@ function AppInner() {
   const [editingInstruction, setEditingInstruction] = useState<Instruction | null>(null);
   const [viewingSession, setViewingSession] = useState<SessionHistory | null>(null);
   const sessionManagerRef = useRef<LiveSessionManager | null>(null);
+  const chatManagerRef = useRef<ChatSessionManager | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const activeMode = isLiveModel(model) ? 'live' : 'text';
 
   // Detecta sessao abandonada no mount
   useEffect(() => {
@@ -117,6 +136,9 @@ function AppInner() {
   useEffect(() => { localStorage.setItem('livego_instructions', JSON.stringify(instructions)); }, [instructions]);
   useEffect(() => { localStorage.setItem('livego_active_instruction', activeInstructionId); }, [activeInstructionId]);
   useEffect(() => { localStorage.setItem('livego_use_context', String(useConversationContext)); }, [useConversationContext]);
+  useEffect(() => { localStorage.setItem('livego_model', model); }, [model]);
+  useEffect(() => { localStorage.setItem('livego_tts_enabled', String(ttsEnabled)); setTTSEnabled(ttsEnabled); }, [ttsEnabled]);
+  useEffect(() => { localStorage.setItem('livego_tts_rate', String(ttsRate)); setTTSRate(ttsRate); }, [ttsRate]);
 
   const persistHistory = (session: SessionHistory) => {
     const hasRealMessages = session.messages.some(
@@ -144,15 +166,12 @@ function AppInner() {
   const handleUnexpectedDisconnect = (data: { transcript: string; closeCode: number; closeReason: string }) => {
     const durationMs = Date.now() - startTimeRef.current;
     lastDisconnectRef.current = Date.now();
-
     if (durationMs < MIN_SESSION_MS) {
-      console.log('[App] Sessao < 5s, ignorando dropped session');
       localStorage.removeItem(DROPPED_SESSION_KEY);
       localStorage.removeItem(ACTIVE_SESSION_KEY);
       setSessionDropped(false);
       return;
     }
-
     if (data.transcript.trim().length > 0) {
       const dropped: DroppedSession = {
         transcript: data.transcript,
@@ -167,54 +186,75 @@ function AppInner() {
     }
   };
 
+  // Inicializa os dois managers uma vez
   useEffect(() => {
     sessionManagerRef.current = new LiveSessionManager();
-    sessionManagerRef.current.setCallbacks(
-      (msg) => {
-        if (msg.isMicError) setMicBlocked(true);
-        setMessages((prev) => {
-          let next: Message[];
-          if (prev.length === 0) {
-            next = [msg];
-          } else if (msg.role === 'system' || msg.isToolCall) {
-            next = [...prev, msg];
+    chatManagerRef.current = new ChatSessionManager();
+
+    const onMsg = (msg: Message) => {
+      if (msg.isMicError) setMicBlocked(true);
+      setMessages((prev) => {
+        let next: Message[];
+        if (prev.length === 0) {
+          next = [msg];
+        } else if (msg.role === 'system' || msg.isToolCall) {
+          next = [...prev, msg];
+        } else {
+          let targetIndex = -1;
+          for (let i = prev.length - 1; i >= 0; i--) {
+            if (prev[i].role !== msg.role) break;
+            if (prev[i].isThinking === msg.isThinking && !prev[i].isToolCall) {
+              if (prev[i].id === msg.id) { targetIndex = i; break; }
+              // Live mode sem id fixo
+              if (msg.role !== 'user') { targetIndex = i; break; }
+            }
+          }
+          if (targetIndex !== -1) {
+            next = [...prev];
+            next[targetIndex] = { ...next[targetIndex], text: next[targetIndex].text + (msg.id === next[targetIndex].id ? msg.text.slice(next[targetIndex].text.length) : msg.text) };
           } else {
-            let targetIndex = -1;
-            for (let i = prev.length - 1; i >= 0; i--) {
-              if (prev[i].role !== msg.role) break;
-              if (prev[i].isThinking === msg.isThinking && !prev[i].isToolCall) {
-                targetIndex = i;
-                break;
-              }
-            }
-            if (targetIndex !== -1) {
-              next = [...prev];
-              next[targetIndex] = { ...next[targetIndex], text: next[targetIndex].text + msg.text };
-            } else {
-              next = [...prev, msg];
-            }
+            next = [...prev, msg];
           }
-          if (currentSessionRef.current) {
-            currentSessionRef.current.messages = next;
-            persistHistory(currentSessionRef.current);
-          }
-          return next;
-        });
-      },
-      (newStatus) => {
-        setStatus(newStatus);
-        if (newStatus === 'Connected' || newStatus === 'Conectado (sem microfone)') {
-          setIsConnected(true);
         }
-        if (newStatus === 'Disconnected' || newStatus === 'Connection Failed') {
-          setIsConnected(false);
-          setMicMuted(false);
-          setAudioOutputMuted(false);
-          setMicBlocked(false);
+        if (currentSessionRef.current) {
+          currentSessionRef.current.messages = next;
+          persistHistory(currentSessionRef.current);
         }
+        return next;
+      });
+    };
+
+    const onStatus = (newStatus: string) => {
+      setStatus(newStatus);
+      if (newStatus === 'Connected' || newStatus.startsWith('Conectado')) {
+        setIsConnected(true);
       }
-    );
-    return () => { sessionManagerRef.current?.disconnect(); };
+      if (newStatus === 'Disconnected' || newStatus === 'Connection Failed') {
+        setIsConnected(false);
+        setMicMuted(false);
+        setAudioOutputMuted(false);
+        setMicBlocked(false);
+      }
+    };
+
+    sessionManagerRef.current.setCallbacks(onMsg, onStatus);
+    chatManagerRef.current.setConfig({
+      model,
+      systemInstruction: '',
+      thinkingMode,
+      thinkingBudget,
+      grounding: groundingSearch,
+      functionCalling,
+      ttsEnabled,
+      ttsRate,
+      onMessage: onMsg,
+      onStatus,
+    });
+
+    return () => {
+      sessionManagerRef.current?.disconnect();
+      chatManagerRef.current?.stop();
+    };
   }, []);
 
   const buildSystemInstruction = (baseInstruction: string): string => {
@@ -247,7 +287,6 @@ function AppInner() {
     return instruction;
   };
 
-  // Conectar — inicia nova sessao
   const handleConnect = async () => {
     const timeSince = Date.now() - lastDisconnectRef.current;
     if (lastDisconnectRef.current > 0 && timeSince < RECONNECT_COOLDOWN) {
@@ -271,24 +310,76 @@ function AppInner() {
       model,
       voice,
       messages: [],
+      mode: activeMode,
     };
 
-    await sessionManagerRef.current?.connect({
-      voice,
-      thinkingMode,
-      grounding: groundingSearch,
-      functionCalling,
-      sessionContext,
-      mediaResolution,
-      turnCoverage,
-      playAudio,
-      systemInstruction,
-      useConversationContext,
-      onUnexpectedDisconnect: handleUnexpectedDisconnect,
-    });
+    if (activeMode === 'live') {
+      await sessionManagerRef.current?.connect({
+        voice,
+        thinkingMode,
+        grounding: groundingSearch,
+        functionCalling,
+        sessionContext,
+        mediaResolution,
+        turnCoverage,
+        playAudio,
+        systemInstruction,
+        useConversationContext,
+        onUnexpectedDisconnect: handleUnexpectedDisconnect,
+      });
+    } else {
+      // Modo texto — atualiza config com instruction e modelo corretos
+      chatManagerRef.current?.setConfig({
+        model,
+        systemInstruction,
+        thinkingMode,
+        thinkingBudget,
+        grounding: groundingSearch,
+        functionCalling,
+        ttsEnabled,
+        ttsRate,
+        onMessage: (msg) => {
+          if (msg.isMicError) setMicBlocked(true);
+          setMessages((prev) => {
+            let next: Message[];
+            if (prev.length === 0) {
+              next = [msg];
+            } else if (msg.role === 'system' || msg.isToolCall) {
+              next = [...prev, msg];
+            } else {
+              // Atualiza mensagem existente pelo id (streaming)
+              const idx = prev.findLastIndex(
+                (m) => m.id === msg.id && m.role === msg.role
+              );
+              if (idx !== -1) {
+                next = [...prev];
+                next[idx] = msg;
+              } else {
+                next = [...prev, msg];
+              }
+            }
+            if (currentSessionRef.current) {
+              currentSessionRef.current.messages = next;
+              persistHistory(currentSessionRef.current);
+            }
+            return next;
+          });
+        },
+        onStatus: (newStatus) => {
+          setStatus(newStatus);
+          if (newStatus === 'Connected' || newStatus.startsWith('Conectado')) setIsConnected(true);
+          if (newStatus === 'Disconnected') {
+            setIsConnected(false);
+            setMicMuted(false);
+            setAudioOutputMuted(false);
+            setMicBlocked(false);
+          }
+        },
+      });
+      chatManagerRef.current?.start();
+    }
   };
 
-  // Encerrar — desconecta, salva historico, limpa estado
   const handleEndCall = async () => {
     if (currentSessionRef.current) {
       currentSessionRef.current.endedAt = new Date().toISOString();
@@ -298,28 +389,47 @@ function AppInner() {
     localStorage.removeItem(ACTIVE_SESSION_KEY);
     localStorage.removeItem(DROPPED_SESSION_KEY);
     setSessionDropped(false);
-    await sessionManagerRef.current?.disconnect();
+    cancelTTS();
+    if (activeMode === 'live') {
+      await sessionManagerRef.current?.disconnect();
+    } else {
+      chatManagerRef.current?.stop();
+    }
   };
 
-  // Mic — apenas pause/resume, sessao continua viva
   const toggleMicMute = () => {
-    if (!isConnected || !sessionManagerRef.current || micBlocked) return;
+    if (!isConnected || micBlocked) return;
     const newMuted = !micMuted;
     setMicMuted(newMuted);
-    sessionManagerRef.current.setMicMuted(newMuted);
+    if (activeMode === 'live') {
+      sessionManagerRef.current?.setMicMuted(newMuted);
+    } else {
+      chatManagerRef.current?.setMicMuted(newMuted);
+    }
   };
 
   const toggleAudioOutputMute = () => {
     const newMuted = !audioOutputMuted;
     setAudioOutputMuted(newMuted);
-    sessionManagerRef.current?.setAudioOutputMuted(newMuted);
+    if (activeMode === 'live') {
+      sessionManagerRef.current?.setAudioOutputMuted(newMuted);
+    } else {
+      setTtsEnabled(!newMuted);
+      setTTSEnabled(!newMuted);
+      if (newMuted) cancelTTS();
+    }
   };
 
   const handleSendText = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputText.trim() || !isConnected) return;
-    await sessionManagerRef.current?.sendText(inputText);
+    const text = inputText;
     setInputText('');
+    if (activeMode === 'live') {
+      await sessionManagerRef.current?.sendText(text);
+    } else {
+      await chatManagerRef.current?.sendMessage(text);
+    }
   };
 
   return (
@@ -330,10 +440,19 @@ function AppInner() {
             <Sparkles className="w-5 h-5 text-blue-400" />
             <h1 className="font-medium text-gray-100">Gemini Live Hub</h1>
             <span className={cn(
-              'ml-3 px-2 py-0.5 rounded-full text-xs font-medium',
+              'ml-1 px-2 py-0.5 rounded-full text-xs font-medium',
               isConnected ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'
             )}>
               {status}
+            </span>
+            {/* Badge de modo */}
+            <span className={cn(
+              'px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wide',
+              activeMode === 'live'
+                ? 'bg-purple-500/20 text-purple-400'
+                : 'bg-cyan-500/20 text-cyan-400'
+            )}>
+              {activeMode === 'live' ? '⚡ Live' : '💬 Texto'}
             </span>
           </div>
           <button onClick={() => setIsSidebarOpen(!isSidebarOpen)} className="p-2 hover:bg-white/5 rounded-lg transition-colors">
@@ -341,7 +460,6 @@ function AppInner() {
           </button>
         </header>
 
-        {/* Banner dropped session */}
         {sessionDropped && !isConnected && (
           <div className="mx-4 mt-3 px-4 py-3 rounded-xl bg-blue-500/10 border border-blue-500/30 flex items-start gap-3">
             <RotateCcw className="w-4 h-4 text-blue-400 mt-0.5 shrink-0" />
@@ -356,14 +474,14 @@ function AppInner() {
           </div>
         )}
 
-        {/* Banner microfone bloqueado */}
         {micBlocked && (
           <div className="mx-4 mt-3 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/30 flex items-start gap-3">
             <AlertTriangle className="w-4 h-4 text-yellow-400 mt-0.5 shrink-0" />
             <div className="text-sm text-yellow-300">
               <span className="font-medium">Microfone bloqueado.</span>{' '}
-              Clique no <span className="font-mono bg-white/10 px-1 rounded">🔒</span> na barra de endereço, permita o microfone e recarregue a página.
-              O chat por texto continua funcionando.
+              {activeMode === 'live'
+                ? 'Clique no 🔒 na barra de endereço, permita o microfone e recarregue a página.'
+                : 'Permita o microfone nas configurações do browser. O chat por texto continua funcionando.'}
             </div>
           </div>
         )}
@@ -371,8 +489,14 @@ function AppInner() {
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
           {messages.length === 0 && !isConnected && (
             <div className="h-full flex flex-col items-center justify-center text-gray-500 space-y-4">
-              <AudioLines className="w-16 h-16 opacity-20" />
-              <p>Conecte e comece a falar, ou escreva uma mensagem.</p>
+              {activeMode === 'live'
+                ? <AudioLines className="w-16 h-16 opacity-20" />
+                : <MessageSquare className="w-16 h-16 opacity-20" />}
+              <p>
+                {activeMode === 'live'
+                  ? 'Conecte e comece a falar, ou escreva uma mensagem.'
+                  : `Modo Texto ativo (${model}). Conecte para começar.`}
+              </p>
             </div>
           )}
           {messages.map((msg, i) => {
@@ -413,26 +537,22 @@ function AppInner() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Barra de controles */}
         <div className="p-4 bg-[#1e1e1e] border-t border-white/10">
           <form onSubmit={handleSendText} className="flex gap-2 max-w-4xl mx-auto items-center">
 
-            {/* DESCONECTADO: só botão Conectar */}
             {!isConnected && (
               <button
                 type="button"
                 onClick={handleConnect}
-                title="Conectar e iniciar voz"
+                title="Conectar"
                 className="p-3 rounded-xl flex items-center justify-center transition-all shrink-0 bg-blue-600 text-white hover:bg-blue-700"
               >
                 <Mic className="w-5 h-5" />
               </button>
             )}
 
-            {/* CONECTADO: Mic pause/resume + volume + Encerrar */}
             {isConnected && (
               <>
-                {/* Mic — pause/resume, sessao continua viva */}
                 {!micBlocked && (
                   <button
                     type="button"
@@ -453,11 +573,10 @@ function AppInner() {
                   </button>
                 )}
 
-                {/* Audio output mute */}
                 <button
                   type="button"
                   onClick={toggleAudioOutputMute}
-                  title={audioOutputMuted ? 'Ligar áudio de saída' : 'Silenciar áudio de saída'}
+                  title={audioOutputMuted ? 'Ligar áudio' : 'Silenciar áudio'}
                   className={cn(
                     'p-3 rounded-xl flex items-center justify-center transition-all shrink-0',
                     audioOutputMuted
@@ -468,7 +587,6 @@ function AppInner() {
                   {audioOutputMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
                 </button>
 
-                {/* Encerrar sessao */}
                 <button
                   type="button"
                   onClick={handleEndCall}
@@ -480,7 +598,6 @@ function AppInner() {
               </>
             )}
 
-            {/* Input texto */}
             <div className="flex-1 relative">
               <input
                 type="text"
@@ -500,7 +617,6 @@ function AppInner() {
             </div>
           </form>
 
-          {/* Labels embaixo dos botoes */}
           {isConnected && (
             <div className="flex gap-2 max-w-4xl mx-auto mt-2 px-1 items-start">
               {!micBlocked && (
@@ -535,11 +651,32 @@ function AppInner() {
               <div className="space-y-2">
                 <label className="text-xs text-gray-400">Seletor de modelo</label>
                 <select value={model} onChange={(e) => setModel(e.target.value)}
-                  className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500">
-                  <option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5-flash-native-audio...</option>
-                  <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                  disabled={isConnected}
+                  className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-50">
+                  <optgroup label="── Live (voz nativa) ──">
+                    <option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5-flash-native-audio...</option>
+                  </optgroup>
+                  <optgroup label="── Texto + STT + TTS ──">
+                    <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview</option>
+                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                    <option value="gemini-2.5-pro-preview-06-05">gemini-2.5-pro-preview</option>
+                  </optgroup>
                 </select>
+                {isConnected && (
+                  <p className="text-[10px] text-gray-500">Encerre a sessão para trocar o modelo.</p>
+                )}
+                <div className={cn(
+                  'text-[10px] px-2 py-1 rounded font-medium',
+                  activeMode === 'live'
+                    ? 'bg-purple-500/10 text-purple-400'
+                    : 'bg-cyan-500/10 text-cyan-400'
+                )}>
+                  {activeMode === 'live'
+                    ? '⚡ Modo Live — WebSocket + voz nativa Gemini'
+                    : '💬 Modo Texto — Chrome STT + REST + TTS navegador'}
+                </div>
               </div>
+
               <ToggleRow label="Thinking mode" checked={thinkingMode} onChange={setThinkingMode} />
               <div className="space-y-2">
                 <div className="flex justify-between text-xs">
@@ -565,26 +702,43 @@ function AppInner() {
 
           <CollapsibleSection title="🎙 VOZ" defaultOpen>
             <div className="space-y-4">
-              <div className="space-y-2">
-                <label className="text-xs text-gray-400">Seletor de voz</label>
-                <div className="relative">
-                  <select value={voice} onChange={(e) => setVoice(e.target.value)}
-                    className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500">
-                    <option value="Zephyr">Zephyr (Brilhante)</option>
-                    <option value="Puck">Puck (Upbeat)</option>
-                    <option value="Charon">Charon (Informativa)</option>
-                    <option value="Kore">Kore (Firme)</option>
-                    <option value="Fenrir">Fenrir (Excitável)</option>
-                    <option value="Aoede">Aoede (Breezy)</option>
-                    <option value="Enceladus">Enceladus (Breathy)</option>
-                    <option value="Sulafat">Sulafat (Quente)</option>
-                    <option value="Achird">Achird (Amigável)</option>
-                    <option value="Sadaltager">Sadaltager (Conhecimento)</option>
-                  </select>
-                  <AudioLines className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
-                </div>
-              </div>
-              <ToggleRow label="Play Audio (Mute)" checked={playAudio} onChange={setPlayAudio} />
+              {activeMode === 'live' ? (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-xs text-gray-400">Seletor de voz (Live)</label>
+                    <div className="relative">
+                      <select value={voice} onChange={(e) => setVoice(e.target.value)}
+                        className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500">
+                        <option value="Zephyr">Zephyr (Brilhante)</option>
+                        <option value="Puck">Puck (Upbeat)</option>
+                        <option value="Charon">Charon (Informativa)</option>
+                        <option value="Kore">Kore (Firme)</option>
+                        <option value="Fenrir">Fenrir (Excitável)</option>
+                        <option value="Aoede">Aoede (Breezy)</option>
+                        <option value="Enceladus">Enceladus (Breathy)</option>
+                        <option value="Sulafat">Sulafat (Quente)</option>
+                        <option value="Achird">Achird (Amigável)</option>
+                        <option value="Sadaltager">Sadaltager (Conhecimento)</option>
+                      </select>
+                      <AudioLines className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+                    </div>
+                  </div>
+                  <ToggleRow label="Play Audio" checked={playAudio} onChange={setPlayAudio} />
+                </>
+              ) : (
+                <>
+                  <p className="text-xs text-gray-500">Modo Texto usa as vozes instaladas no sistema/browser.</p>
+                  <ToggleRow label="TTS habilitado" checked={ttsEnabled} onChange={setTtsEnabled} />
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-gray-200">Velocidade da fala</span>
+                      <span className="text-gray-400">{ttsRate.toFixed(1)}x</span>
+                    </div>
+                    <input type="range" min="0.5" max="2" step="0.1" value={ttsRate}
+                      onChange={(e) => setTtsRate(parseFloat(e.target.value))} className="w-full" />
+                  </div>
+                </>
+              )}
             </div>
           </CollapsibleSection>
 
@@ -643,7 +797,9 @@ function AppInner() {
                       <div className="flex flex-col min-w-0 flex-1">
                         <span className="text-gray-300 truncate">{new Date(session.startedAt).toLocaleString()}</span>
                         <span className="text-gray-500 truncate">
-                          {session.wasDropped && '⚡ '}{session.instruction} · {session.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')).length} msgs
+                          {session.wasDropped && '⚡ '}
+                          {session.mode === 'text' && '💬 '}
+                          {session.instruction} · {session.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')).length} msgs
                         </span>
                       </div>
                       <div className="flex items-center gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity shrink-0 ml-2">
@@ -674,10 +830,10 @@ function AppInner() {
                   <button onClick={() => {
                     let txt = '';
                     for (const sess of history) {
-                      txt += `\n${'='.repeat(60)}\nSESSÃO: ${sess.startedAt}\nModelo: ${sess.model} | Voz: ${sess.voice}\nInstruction: ${sess.instruction}\n${'='.repeat(60)}\n\n`;
+                      txt += `\n${'='.repeat(60)}\nSESSÃO: ${sess.startedAt}\nModelo: ${sess.model} | Modo: ${sess.mode || 'live'}\nInstruction: ${sess.instruction}\n${'='.repeat(60)}\n\n`;
                       for (const msg of sess.messages) {
                         if (msg.isThinking) continue;
-                        txt += `[${new Date(parseInt(msg.id) || Date.now()).toISOString()}] ${msg.role.toUpperCase()}: ${msg.text}\n`;
+                        txt += `${msg.role.toUpperCase()}: ${msg.text}\n`;
                       }
                     }
                     const blob = new Blob([txt], { type: 'text/plain' });
@@ -718,15 +874,13 @@ function AppInner() {
                 <label className="text-sm text-gray-400">Nome</label>
                 <input type="text" value={editingInstruction.name}
                   onChange={(e) => setEditingInstruction({ ...editingInstruction, name: e.target.value })}
-                  className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  placeholder="Ex: Ator psicólogo" />
+                  className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500" />
               </div>
               <div className="space-y-2 flex-1 flex flex-col">
                 <label className="text-sm text-gray-400">System Instruction</label>
                 <textarea value={editingInstruction.text}
                   onChange={(e) => setEditingInstruction({ ...editingInstruction, text: e.target.value })}
-                  className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500 min-h-[200px] flex-1 resize-none"
-                  placeholder="Você é um assistente..." />
+                  className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500 min-h-[200px] flex-1 resize-none" />
               </div>
             </div>
             <div className="p-4 border-t border-white/10 flex justify-end gap-2 shrink-0">
@@ -751,8 +905,8 @@ function AppInner() {
             <div className="p-4 border-b border-white/10 flex items-center justify-between shrink-0">
               <div>
                 <h3 className="text-lg font-medium text-gray-200">Detalhes da Sessão</h3>
-                <p className="text-xs text-gray-500 mt-1">{new Date(viewingSession.startedAt).toLocaleString()} • {viewingSession.model} • {viewingSession.voice}</p>
-                <p className="text-xs text-blue-400 mt-0.5">Instruction: {viewingSession.instruction}</p>
+                <p className="text-xs text-gray-500 mt-1">{new Date(viewingSession.startedAt).toLocaleString()} • {viewingSession.model}</p>
+                <p className="text-xs text-blue-400 mt-0.5">Instruction: {viewingSession.instruction} · Modo: {viewingSession.mode || 'live'}</p>
               </div>
               <button onClick={() => setViewingSession(null)} className="text-gray-400 hover:text-gray-200 p-2">✕</button>
             </div>
