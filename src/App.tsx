@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings, Mic, MicOff, Send, AudioLines, Sparkles, Cpu, Edit2, Trash2, Plus, Eye, Download, Volume2, VolumeX, AlertTriangle, RotateCcw } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, AudioLines, Sparkles, Cpu, Edit2, Trash2, Plus, Eye, Download, Volume2, VolumeX, AlertTriangle, RotateCcw, PhoneOff } from 'lucide-react';
 import { cn } from './lib/utils';
 import { LiveSessionManager, Message, DroppedSession } from './lib/live';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -7,8 +7,8 @@ import ReactMarkdown from 'react-markdown';
 
 const DROPPED_SESSION_KEY = 'livego_dropped_session';
 const ACTIVE_SESSION_KEY  = 'livego_active_session';
-const MIN_SESSION_MS      = 5000;  // sessoes < 5s sao ignoradas
-const RECONNECT_COOLDOWN  = 3000;  // ms de espera apos queda inesperada
+const MIN_SESSION_MS      = 5000;
+const RECONNECT_COOLDOWN  = 3000;
 
 interface Instruction {
   id: string;
@@ -88,7 +88,7 @@ function AppInner() {
   const sessionManagerRef = useRef<LiveSessionManager | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Detecta sessao abandonada no mount (app fechou durante sessao)
+  // Detecta sessao abandonada no mount
   useEffect(() => {
     try {
       const activeRaw = localStorage.getItem(ACTIVE_SESSION_KEY);
@@ -114,17 +114,9 @@ function AppInner() {
     }
   }, []);
 
-  useEffect(() => {
-    localStorage.setItem('livego_instructions', JSON.stringify(instructions));
-  }, [instructions]);
-
-  useEffect(() => {
-    localStorage.setItem('livego_active_instruction', activeInstructionId);
-  }, [activeInstructionId]);
-
-  useEffect(() => {
-    localStorage.setItem('livego_use_context', String(useConversationContext));
-  }, [useConversationContext]);
+  useEffect(() => { localStorage.setItem('livego_instructions', JSON.stringify(instructions)); }, [instructions]);
+  useEffect(() => { localStorage.setItem('livego_active_instruction', activeInstructionId); }, [activeInstructionId]);
+  useEffect(() => { localStorage.setItem('livego_use_context', String(useConversationContext)); }, [useConversationContext]);
 
   const persistHistory = (session: SessionHistory) => {
     const hasRealMessages = session.messages.some(
@@ -149,12 +141,10 @@ function AppInner() {
     sessionManagerRef.current?.setMuted(!playAudio);
   }, [playAudio]);
 
-  // Handler de queda inesperada
   const handleUnexpectedDisconnect = (data: { transcript: string; closeCode: number; closeReason: string }) => {
     const durationMs = Date.now() - startTimeRef.current;
     lastDisconnectRef.current = Date.now();
 
-    // Sessao muito curta — ignora para nao criar loop
     if (durationMs < MIN_SESSION_MS) {
       console.log('[App] Sessao < 5s, ignorando dropped session');
       localStorage.removeItem(DROPPED_SESSION_KEY);
@@ -163,7 +153,6 @@ function AppInner() {
       return;
     }
 
-    // Salva dropped session para reinjecao de contexto
     if (data.transcript.trim().length > 0) {
       const dropped: DroppedSession = {
         transcript: data.transcript,
@@ -230,8 +219,6 @@ function AppInner() {
 
   const buildSystemInstruction = (baseInstruction: string): string => {
     let instruction = baseInstruction;
-
-    // Injeta contexto de dropped session (maior prioridade)
     try {
       const droppedRaw = localStorage.getItem(DROPPED_SESSION_KEY);
       if (droppedRaw) {
@@ -246,7 +233,6 @@ function AppInner() {
       }
     } catch (e) { /* ignore */ }
 
-    // Injeta contexto de historico recente (se habilitado)
     if (useConversationContext && history.length > 0) {
       const recentMessages = history
         .slice(0, 3)
@@ -258,63 +244,64 @@ function AppInner() {
         instruction += `\n\n[Contexto de conversas anteriores]:\n${recentMessages}`;
       }
     }
-
     return instruction;
   };
 
-  const toggleConnection = async () => {
-    if (isConnected) {
-      if (currentSessionRef.current) {
-        currentSessionRef.current.endedAt = new Date().toISOString();
-        persistHistory(currentSessionRef.current);
-        currentSessionRef.current = null;
-      }
-      localStorage.removeItem(ACTIVE_SESSION_KEY);
-      localStorage.removeItem(DROPPED_SESSION_KEY);
-      setSessionDropped(false);
-      await sessionManagerRef.current?.disconnect();
-    } else {
-      // Cooldown apos queda inesperada
-      const timeSince = Date.now() - lastDisconnectRef.current;
-      if (lastDisconnectRef.current > 0 && timeSince < RECONNECT_COOLDOWN) {
-        await new Promise(r => setTimeout(r, RECONNECT_COOLDOWN - timeSince));
-      }
-
-      setMessages([]);
-      setMicMuted(false);
-      setAudioOutputMuted(false);
-      setMicBlocked(false);
-      startTimeRef.current = Date.now();
-
-      const activeInstruction = instructions.find((i) => i.id === activeInstructionId);
-      const baseInstruction = activeInstruction?.text || 'Você é um assistente. Responda em português.';
-      const systemInstruction = buildSystemInstruction(baseInstruction);
-
-      currentSessionRef.current = {
-        id: 'sess_' + Date.now(),
-        startedAt: new Date().toISOString(),
-        instruction: activeInstruction?.name || 'Unknown',
-        model,
-        voice,
-        messages: [],
-      };
-
-      await sessionManagerRef.current?.connect({
-        voice,
-        thinkingMode,
-        grounding: groundingSearch,
-        functionCalling,
-        sessionContext,
-        mediaResolution,
-        turnCoverage,
-        playAudio,
-        systemInstruction,
-        useConversationContext,
-        onUnexpectedDisconnect: handleUnexpectedDisconnect,
-      });
+  // Conectar — inicia nova sessao
+  const handleConnect = async () => {
+    const timeSince = Date.now() - lastDisconnectRef.current;
+    if (lastDisconnectRef.current > 0 && timeSince < RECONNECT_COOLDOWN) {
+      await new Promise(r => setTimeout(r, RECONNECT_COOLDOWN - timeSince));
     }
+
+    setMessages([]);
+    setMicMuted(false);
+    setAudioOutputMuted(false);
+    setMicBlocked(false);
+    startTimeRef.current = Date.now();
+
+    const activeInstruction = instructions.find((i) => i.id === activeInstructionId);
+    const baseInstruction = activeInstruction?.text || 'Você é um assistente. Responda em português.';
+    const systemInstruction = buildSystemInstruction(baseInstruction);
+
+    currentSessionRef.current = {
+      id: 'sess_' + Date.now(),
+      startedAt: new Date().toISOString(),
+      instruction: activeInstruction?.name || 'Unknown',
+      model,
+      voice,
+      messages: [],
+    };
+
+    await sessionManagerRef.current?.connect({
+      voice,
+      thinkingMode,
+      grounding: groundingSearch,
+      functionCalling,
+      sessionContext,
+      mediaResolution,
+      turnCoverage,
+      playAudio,
+      systemInstruction,
+      useConversationContext,
+      onUnexpectedDisconnect: handleUnexpectedDisconnect,
+    });
   };
 
+  // Encerrar — desconecta, salva historico, limpa estado
+  const handleEndCall = async () => {
+    if (currentSessionRef.current) {
+      currentSessionRef.current.endedAt = new Date().toISOString();
+      persistHistory(currentSessionRef.current);
+      currentSessionRef.current = null;
+    }
+    localStorage.removeItem(ACTIVE_SESSION_KEY);
+    localStorage.removeItem(DROPPED_SESSION_KEY);
+    setSessionDropped(false);
+    await sessionManagerRef.current?.disconnect();
+  };
+
+  // Mic — apenas pause/resume, sessao continua viva
   const toggleMicMute = () => {
     if (!isConnected || !sessionManagerRef.current || micBlocked) return;
     const newMuted = !micMuted;
@@ -426,56 +413,74 @@ function AppInner() {
           <div ref={messagesEndRef} />
         </div>
 
+        {/* Barra de controles */}
         <div className="p-4 bg-[#1e1e1e] border-t border-white/10">
           <form onSubmit={handleSendText} className="flex gap-2 max-w-4xl mx-auto items-center">
-            <button
-              type="button"
-              onClick={toggleConnection}
-              title={isConnected ? 'Desconectar' : 'Conectar e iniciar voz'}
-              className={cn(
-                'p-3 rounded-xl flex items-center justify-center transition-all shrink-0',
-                isConnected
-                  ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30'
-                  : 'bg-blue-600 text-white hover:bg-blue-700'
-              )}
-            >
-              {isConnected ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-            </button>
 
-            {isConnected && !micBlocked && (
+            {/* DESCONECTADO: só botão Conectar */}
+            {!isConnected && (
               <button
                 type="button"
-                onClick={toggleMicMute}
-                title={micMuted ? 'Desmutar microfone' : 'Mutar microfone'}
-                className={cn(
-                  'p-3 rounded-xl flex items-center justify-center transition-all shrink-0 relative',
-                  micMuted
-                    ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/40'
-                    : 'bg-white/5 text-gray-300 hover:bg-white/10'
-                )}
+                onClick={handleConnect}
+                title="Conectar e iniciar voz"
+                className="p-3 rounded-xl flex items-center justify-center transition-all shrink-0 bg-blue-600 text-white hover:bg-blue-700"
               >
-                {micMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-                <span className={cn(
-                  'absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full',
-                  micMuted ? 'bg-red-400' : 'bg-green-400 animate-pulse'
-                )} />
+                <Mic className="w-5 h-5" />
               </button>
             )}
 
-            <button
-              type="button"
-              onClick={toggleAudioOutputMute}
-              title={audioOutputMuted ? 'Desmutar áudio de saída' : 'Mutar áudio de saída'}
-              className={cn(
-                'p-3 rounded-xl flex items-center justify-center transition-all shrink-0',
-                audioOutputMuted
-                  ? 'bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 ring-1 ring-orange-500/40'
-                  : 'bg-white/5 text-gray-300 hover:bg-white/10'
-              )}
-            >
-              {audioOutputMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-            </button>
+            {/* CONECTADO: Mic pause/resume + volume + Encerrar */}
+            {isConnected && (
+              <>
+                {/* Mic — pause/resume, sessao continua viva */}
+                {!micBlocked && (
+                  <button
+                    type="button"
+                    onClick={toggleMicMute}
+                    title={micMuted ? 'Retomar microfone' : 'Pausar microfone'}
+                    className={cn(
+                      'p-3 rounded-xl flex items-center justify-center transition-all shrink-0 relative',
+                      micMuted
+                        ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 ring-1 ring-amber-500/40'
+                        : 'bg-green-500/20 text-green-400 hover:bg-green-500/30 ring-1 ring-green-500/30'
+                    )}
+                  >
+                    {micMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
+                    <span className={cn(
+                      'absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full',
+                      micMuted ? 'bg-amber-400' : 'bg-green-400 animate-pulse'
+                    )} />
+                  </button>
+                )}
 
+                {/* Audio output mute */}
+                <button
+                  type="button"
+                  onClick={toggleAudioOutputMute}
+                  title={audioOutputMuted ? 'Ligar áudio de saída' : 'Silenciar áudio de saída'}
+                  className={cn(
+                    'p-3 rounded-xl flex items-center justify-center transition-all shrink-0',
+                    audioOutputMuted
+                      ? 'bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 ring-1 ring-orange-500/40'
+                      : 'bg-white/5 text-gray-300 hover:bg-white/10'
+                  )}
+                >
+                  {audioOutputMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                </button>
+
+                {/* Encerrar sessao */}
+                <button
+                  type="button"
+                  onClick={handleEndCall}
+                  title="Encerrar sessão"
+                  className="p-3 rounded-xl flex items-center justify-center transition-all shrink-0 bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/30"
+                >
+                  <PhoneOff className="w-4 h-4" />
+                </button>
+              </>
+            )}
+
+            {/* Input texto */}
             <div className="flex-1 relative">
               <input
                 type="text"
@@ -495,17 +500,18 @@ function AppInner() {
             </div>
           </form>
 
+          {/* Labels embaixo dos botoes */}
           {isConnected && (
-            <div className="flex gap-2 max-w-4xl mx-auto mt-2 px-1">
-              <span className="text-[10px] text-gray-600 w-[46px] text-center">desconectar</span>
+            <div className="flex gap-2 max-w-4xl mx-auto mt-2 px-1 items-start">
               {!micBlocked && (
-                <span className="text-[10px] text-gray-600 w-[46px] text-center">
-                  {micMuted ? '🔴 mic off' : '🟢 mic on'}
+                <span className="text-[10px] text-gray-600 w-[46px] text-center leading-tight">
+                  {micMuted ? 'mic pausado' : 'mic ativo'}
                 </span>
               )}
-              <span className="text-[10px] text-gray-600 w-[46px] text-center">
-                {audioOutputMuted ? '🔴 audio off' : '🟢 audio on'}
+              <span className="text-[10px] text-gray-600 w-[46px] text-center leading-tight">
+                {audioOutputMuted ? 'som off' : 'som on'}
               </span>
+              <span className="text-[10px] text-red-800 w-[46px] text-center leading-tight">encerrar</span>
             </div>
           )}
         </div>
