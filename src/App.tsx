@@ -1,8 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings, Mic, MicOff, Send, AudioLines, Sparkles, Cpu, Edit2, Trash2, Plus, Eye, Download, Volume2, VolumeX, AlertTriangle } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, AudioLines, Sparkles, Cpu, Edit2, Trash2, Plus, Eye, Download, Volume2, VolumeX, AlertTriangle, RotateCcw } from 'lucide-react';
 import { cn } from './lib/utils';
-import { LiveSessionManager, Message } from './lib/live';
+import { LiveSessionManager, Message, DroppedSession } from './lib/live';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import ReactMarkdown from 'react-markdown';
+
+const DROPPED_SESSION_KEY = 'livego_dropped_session';
+const ACTIVE_SESSION_KEY  = 'livego_active_session';
+const MIN_SESSION_MS      = 5000;  // sessoes < 5s sao ignoradas
+const RECONNECT_COOLDOWN  = 3000;  // ms de espera apos queda inesperada
 
 interface Instruction {
   id: string;
@@ -18,9 +24,18 @@ interface SessionHistory {
   model: string;
   voice: string;
   messages: Message[];
+  wasDropped?: boolean;
 }
 
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppInner />
+    </ErrorBoundary>
+  );
+}
+
+function AppInner() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isConnected, setIsConnected] = useState(false);
   const [status, setStatus] = useState('Disconnected');
@@ -29,6 +44,13 @@ export default function App() {
   const [micMuted, setMicMuted] = useState(false);
   const [audioOutputMuted, setAudioOutputMuted] = useState(false);
   const [micBlocked, setMicBlocked] = useState(false);
+  const [sessionDropped, setSessionDropped] = useState(false);
+  const [useConversationContext, setUseConversationContext] = useState(() => {
+    return localStorage.getItem('livego_use_context') === 'true';
+  });
+
+  const lastDisconnectRef = useRef<number>(0);
+  const startTimeRef = useRef<number>(0);
 
   const [model, setModel] = useState('gemini-2.5-flash-native-audio-preview-12-2025');
   const [voice, setVoice] = useState('Zephyr');
@@ -66,6 +88,32 @@ export default function App() {
   const sessionManagerRef = useRef<LiveSessionManager | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // Detecta sessao abandonada no mount (app fechou durante sessao)
+  useEffect(() => {
+    try {
+      const activeRaw = localStorage.getItem(ACTIVE_SESSION_KEY);
+      if (activeRaw && !localStorage.getItem(DROPPED_SESSION_KEY)) {
+        const active = JSON.parse(activeRaw);
+        if (active.timestamp && Date.now() - active.timestamp < 24 * 60 * 60 * 1000) {
+          const dropped: DroppedSession = {
+            transcript: active.transcript || '',
+            timestamp: active.timestamp,
+            startTime: active.startTime || active.timestamp,
+            closeCode: 0,
+            closeReason: 'App fechado durante sessão',
+          };
+          localStorage.setItem(DROPPED_SESSION_KEY, JSON.stringify(dropped));
+          setSessionDropped(true);
+        }
+        localStorage.removeItem(ACTIVE_SESSION_KEY);
+      } else if (localStorage.getItem(DROPPED_SESSION_KEY)) {
+        setSessionDropped(true);
+      }
+    } catch (e) {
+      console.warn('[App] Failed to check active session:', e);
+    }
+  }, []);
+
   useEffect(() => {
     localStorage.setItem('livego_instructions', JSON.stringify(instructions));
   }, [instructions]);
@@ -74,13 +122,15 @@ export default function App() {
     localStorage.setItem('livego_active_instruction', activeInstructionId);
   }, [activeInstructionId]);
 
+  useEffect(() => {
+    localStorage.setItem('livego_use_context', String(useConversationContext));
+  }, [useConversationContext]);
+
   const persistHistory = (session: SessionHistory) => {
-    // Nunca salva sessao sem mensagens reais (user ou model)
     const hasRealMessages = session.messages.some(
       (m) => (m.role === 'user' || m.role === 'model') && !m.isThinking
     );
     if (!hasRealMessages) return;
-
     setHistory((prev) => {
       const next = [...prev];
       const idx = next.findIndex((s) => s.id === session.id);
@@ -99,12 +149,40 @@ export default function App() {
     sessionManagerRef.current?.setMuted(!playAudio);
   }, [playAudio]);
 
+  // Handler de queda inesperada
+  const handleUnexpectedDisconnect = (data: { transcript: string; closeCode: number; closeReason: string }) => {
+    const durationMs = Date.now() - startTimeRef.current;
+    lastDisconnectRef.current = Date.now();
+
+    // Sessao muito curta — ignora para nao criar loop
+    if (durationMs < MIN_SESSION_MS) {
+      console.log('[App] Sessao < 5s, ignorando dropped session');
+      localStorage.removeItem(DROPPED_SESSION_KEY);
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+      setSessionDropped(false);
+      return;
+    }
+
+    // Salva dropped session para reinjecao de contexto
+    if (data.transcript.trim().length > 0) {
+      const dropped: DroppedSession = {
+        transcript: data.transcript,
+        timestamp: Date.now(),
+        startTime: startTimeRef.current,
+        closeCode: data.closeCode,
+        closeReason: data.closeReason,
+      };
+      localStorage.setItem(DROPPED_SESSION_KEY, JSON.stringify(dropped));
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+      setSessionDropped(true);
+    }
+  };
+
   useEffect(() => {
     sessionManagerRef.current = new LiveSessionManager();
     sessionManagerRef.current.setCallbacks(
       (msg) => {
         if (msg.isMicError) setMicBlocked(true);
-
         setMessages((prev) => {
           let next: Message[];
           if (prev.length === 0) {
@@ -150,25 +228,68 @@ export default function App() {
     return () => { sessionManagerRef.current?.disconnect(); };
   }, []);
 
+  const buildSystemInstruction = (baseInstruction: string): string => {
+    let instruction = baseInstruction;
+
+    // Injeta contexto de dropped session (maior prioridade)
+    try {
+      const droppedRaw = localStorage.getItem(DROPPED_SESSION_KEY);
+      if (droppedRaw) {
+        const dropped: DroppedSession = JSON.parse(droppedRaw);
+        if (dropped.transcript) {
+          instruction += `\n\n[CONTEXTO DA SESSÃO ANTERIOR INTERROMPIDA]:\n${dropped.transcript.substring(0, 2000)}\n\nContinue a conversa naturalmente de onde parou. Não mencione detalhes técnicos da interrupção.`;
+        }
+        localStorage.removeItem(DROPPED_SESSION_KEY);
+        localStorage.removeItem(ACTIVE_SESSION_KEY);
+        setSessionDropped(false);
+        return instruction;
+      }
+    } catch (e) { /* ignore */ }
+
+    // Injeta contexto de historico recente (se habilitado)
+    if (useConversationContext && history.length > 0) {
+      const recentMessages = history
+        .slice(0, 3)
+        .flatMap(s => s.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')))
+        .slice(-20)
+        .map(m => `${m.role === 'user' ? 'Você' : 'Gemini'}: ${m.text}`)
+        .join('\n');
+      if (recentMessages) {
+        instruction += `\n\n[Contexto de conversas anteriores]:\n${recentMessages}`;
+      }
+    }
+
+    return instruction;
+  };
+
   const toggleConnection = async () => {
     if (isConnected) {
       if (currentSessionRef.current) {
         currentSessionRef.current.endedAt = new Date().toISOString();
-        // persistHistory ja ignora sessoes sem mensagens reais
         persistHistory(currentSessionRef.current);
         currentSessionRef.current = null;
       }
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+      localStorage.removeItem(DROPPED_SESSION_KEY);
+      setSessionDropped(false);
       await sessionManagerRef.current?.disconnect();
     } else {
+      // Cooldown apos queda inesperada
+      const timeSince = Date.now() - lastDisconnectRef.current;
+      if (lastDisconnectRef.current > 0 && timeSince < RECONNECT_COOLDOWN) {
+        await new Promise(r => setTimeout(r, RECONNECT_COOLDOWN - timeSince));
+      }
+
       setMessages([]);
       setMicMuted(false);
       setAudioOutputMuted(false);
       setMicBlocked(false);
+      startTimeRef.current = Date.now();
 
       const activeInstruction = instructions.find((i) => i.id === activeInstructionId);
-      const systemInstruction = activeInstruction?.text || 'Você é um assistente. Responda em português.';
+      const baseInstruction = activeInstruction?.text || 'Você é um assistente. Responda em português.';
+      const systemInstruction = buildSystemInstruction(baseInstruction);
 
-      // Cria a sessao em memoria mas NAO persiste ainda — so salva quando chegar mensagem real
       currentSessionRef.current = {
         id: 'sess_' + Date.now(),
         startedAt: new Date().toISOString(),
@@ -188,6 +309,8 @@ export default function App() {
         turnCoverage,
         playAudio,
         systemInstruction,
+        useConversationContext,
+        onUnexpectedDisconnect: handleUnexpectedDisconnect,
       });
     }
   };
@@ -231,6 +354,22 @@ export default function App() {
           </button>
         </header>
 
+        {/* Banner dropped session */}
+        {sessionDropped && !isConnected && (
+          <div className="mx-4 mt-3 px-4 py-3 rounded-xl bg-blue-500/10 border border-blue-500/30 flex items-start gap-3">
+            <RotateCcw className="w-4 h-4 text-blue-400 mt-0.5 shrink-0" />
+            <div className="text-sm text-blue-300 flex-1">
+              <span className="font-medium">Sessão anterior interrompida.</span>{' '}
+              Ao reconectar, o contexto será reinjetado automaticamente.
+            </div>
+            <button
+              onClick={() => { localStorage.removeItem(DROPPED_SESSION_KEY); setSessionDropped(false); }}
+              className="text-blue-400/60 hover:text-blue-300 text-xs shrink-0"
+            >Ignorar</button>
+          </div>
+        )}
+
+        {/* Banner microfone bloqueado */}
         {micBlocked && (
           <div className="mx-4 mt-3 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/30 flex items-start gap-3">
             <AlertTriangle className="w-4 h-4 text-yellow-400 mt-0.5 shrink-0" />
@@ -372,6 +511,7 @@ export default function App() {
         </div>
       </div>
 
+      {/* Sidebar */}
       <div className={cn(
         'config-panel w-[340px] bg-[#1e1e1e] border-l border-white/10 overflow-y-auto transition-all duration-300 ease-in-out shrink-0 flex flex-col',
         isSidebarOpen ? 'translate-x-0' : 'translate-x-full hidden'
@@ -442,6 +582,19 @@ export default function App() {
             </div>
           </CollapsibleSection>
 
+          <CollapsibleSection title="🧠 CONTEXTO" defaultOpen>
+            <div className="space-y-3">
+              <ToggleRow
+                label="Usar contexto de conversas anteriores"
+                checked={useConversationContext}
+                onChange={setUseConversationContext}
+              />
+              <p className="text-xs text-gray-500">
+                Quando ativo, injeta as últimas mensagens do histórico no system instruction ao conectar.
+              </p>
+            </div>
+          </CollapsibleSection>
+
           <CollapsibleSection title="📋 INSTRUCTIONS" defaultOpen>
             <div className="space-y-3">
               <div className="space-y-2">
@@ -483,7 +636,9 @@ export default function App() {
                     <div key={session.id} className="flex items-center justify-between group/item p-2 hover:bg-white/5 rounded-lg transition-colors text-xs">
                       <div className="flex flex-col min-w-0 flex-1">
                         <span className="text-gray-300 truncate">{new Date(session.startedAt).toLocaleString()}</span>
-                        <span className="text-gray-500 truncate">{session.instruction} · {session.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')).length} msgs</span>
+                        <span className="text-gray-500 truncate">
+                          {session.wasDropped && '⚡ '}{session.instruction} · {session.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')).length} msgs
+                        </span>
                       </div>
                       <div className="flex items-center gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity shrink-0 ml-2">
                         <button onClick={() => setViewingSession(session)}

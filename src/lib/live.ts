@@ -2,6 +2,17 @@ import { GoogleGenAI, LiveServerMessage, Modality, MediaResolution, TurnCoverage
 import { AudioRecorder, AudioPlayer } from './audio';
 import { modularTools, handleToolCall } from './tools';
 
+const DROPPED_SESSION_KEY = 'livego_dropped_session';
+const ACTIVE_SESSION_KEY  = 'livego_active_session';
+
+export interface DroppedSession {
+  transcript: string;
+  timestamp: number;
+  startTime: number;
+  closeCode: number;
+  closeReason: string;
+}
+
 export interface LiveConfig {
   voice: string;
   thinkingMode: boolean;
@@ -12,6 +23,8 @@ export interface LiveConfig {
   turnCoverage: boolean;
   playAudio: boolean;
   systemInstruction?: string;
+  useConversationContext?: boolean;
+  onUnexpectedDisconnect?: (data: { transcript: string; closeCode: number; closeReason: string }) => void;
 }
 
 export type Message = {
@@ -31,6 +44,9 @@ export class LiveSessionManager {
   private player: AudioPlayer;
   private onMessageCallback: ((msg: Message) => void) | null = null;
   private onStatusCallback: ((status: string) => void) | null = null;
+  private transcriptLines: string[] = [];
+  private startTime = 0;
+  private debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     const apiKey =
@@ -58,9 +74,26 @@ export class LiveSessionManager {
   getAudioOutputMuted() { return this.player.getAudioMuted(); }
   isMicActive() { return this.recorder.isActive(); }
 
+  private appendTranscript(role: 'user' | 'model', text: string) {
+    this.transcriptLines.push(`${role === 'user' ? 'Você' : 'Gemini'}: ${text}`);
+    // Debounce auto-save da sessao ativa
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = setTimeout(() => {
+      try {
+        localStorage.setItem(ACTIVE_SESSION_KEY, JSON.stringify({
+          transcript: this.transcriptLines.join('\n'),
+          timestamp: Date.now(),
+          startTime: this.startTime,
+        }));
+      } catch (e) { /* ignore */ }
+    }, 3000);
+  }
+
   async connect(config: LiveConfig) {
     if (this.session) await this.disconnect();
     this.player.setAudioMuted(!config.playAudio);
+    this.transcriptLines = [];
+    this.startTime = Date.now();
     this.onStatusCallback?.('Connecting...');
 
     try {
@@ -93,8 +126,6 @@ export class LiveSessionManager {
         callbacks: {
           onopen: async () => {
             this.onStatusCallback?.('Connected');
-
-            // Tenta ligar o microfone — se falhar, avisa mas mantem a sessao viva
             try {
               await this.recorder.start((base64Data) => {
                 this.session?.sendRealtimeInput({
@@ -133,6 +164,7 @@ export class LiveSessionManager {
 
             const outputTranscription = (message.serverContent as any)?.outputTranscription?.text;
             if (outputTranscription) {
+              this.appendTranscript('model', outputTranscription);
               this.onMessageCallback?.({
                 id: Date.now().toString(),
                 role: 'model',
@@ -143,6 +175,7 @@ export class LiveSessionManager {
 
             const inputTranscription = (message.serverContent as any)?.inputTranscription?.text;
             if (inputTranscription) {
+              this.appendTranscript('user', inputTranscription);
               this.onMessageCallback?.({
                 id: Date.now().toString(),
                 role: 'user',
@@ -186,9 +219,23 @@ export class LiveSessionManager {
             this.disconnect();
           },
 
-          onclose: () => {
+          onclose: (event: any) => {
+            const code = event?.code ?? 0;
+            const reason = event?.reason ?? '';
+            console.log('[Live] onclose', code, reason);
+
+            // Desconexao inesperada (nao foi o usuario quem fechou)
+            if (code !== 1000 && config.onUnexpectedDisconnect) {
+              config.onUnexpectedDisconnect({
+                transcript: this.transcriptLines.join('\n'),
+                closeCode: code,
+                closeReason: reason,
+              });
+            }
+
             this.recorder.stop();
             this.session = null;
+            if (this.debounceTimer) clearTimeout(this.debounceTimer);
             this.onStatusCallback?.('Disconnected');
           },
         },
@@ -202,6 +249,7 @@ export class LiveSessionManager {
   async sendText(text: string) {
     if (!this.session) return;
     try {
+      this.appendTranscript('user', text);
       this.session.sendClientContent({
         turns: [{ role: 'user', parts: [{ text }] }],
         turnComplete: true,
@@ -220,6 +268,7 @@ export class LiveSessionManager {
     this.recorder.stop();
     this.player.stop();
     this.session = null;
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
     this.onStatusCallback?.('Disconnected');
   }
 }
