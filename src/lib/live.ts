@@ -21,6 +21,7 @@ export type Message = {
   isToolCall?: boolean;
   toolDetails?: any;
   isThinking?: boolean;
+  isMicError?: boolean;
 };
 
 export class LiveSessionManager {
@@ -32,26 +33,30 @@ export class LiveSessionManager {
   private onStatusCallback: ((status: string) => void) | null = null;
 
   constructor() {
-    const apiKey = (import.meta as any).env?.VITE_GEMINI_API_KEY
-      || (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY)
-      || '';
+    const apiKey =
+      (import.meta as any).env?.VITE_GEMINI_API_KEY ||
+      (typeof process !== 'undefined' && process.env?.GEMINI_API_KEY) ||
+      '';
     if (!apiKey) console.error('GEMINI_API_KEY nao encontrada. Configure VITE_GEMINI_API_KEY.');
     this.ai = new GoogleGenAI({ apiKey });
     this.recorder = new AudioRecorder();
     this.player = new AudioPlayer();
   }
 
-  setCallbacks(onMessage: (msg: Message) => void, onStatus: (status: string) => void) {
+  setCallbacks(
+    onMessage: (msg: Message) => void,
+    onStatus: (status: string) => void
+  ) {
     this.onMessageCallback = onMessage;
     this.onStatusCallback = onStatus;
   }
 
   setMuted(muted: boolean) { this.player.setAudioMuted(muted); }
   setMicMuted(muted: boolean) { this.recorder.setMicMuted(muted); }
-  getMicMuted(): boolean { return this.recorder.getMicMuted(); }
+  getMicMuted() { return this.recorder.getMicMuted(); }
   setAudioOutputMuted(muted: boolean) { this.player.setAudioMuted(muted); }
-  getAudioOutputMuted(): boolean { return this.player.getAudioMuted(); }
-  isMicActive(): boolean { return this.recorder.isActive(); }
+  getAudioOutputMuted() { return this.player.getAudioMuted(); }
+  isMicActive() { return this.recorder.isActive(); }
 
   async connect(config: LiveConfig) {
     if (this.session) await this.disconnect();
@@ -67,30 +72,47 @@ export class LiveSessionManager {
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
-          mediaResolution: config.mediaResolution === 'High'
-            ? MediaResolution.MEDIA_RESOLUTION_HIGH
-            : MediaResolution.MEDIA_RESOLUTION_MEDIUM,
+          mediaResolution:
+            config.mediaResolution === 'High'
+              ? MediaResolution.MEDIA_RESOLUTION_HIGH
+              : MediaResolution.MEDIA_RESOLUTION_MEDIUM,
           realtimeInputConfig: config.turnCoverage
             ? { turnCoverage: TurnCoverage.TURN_INCLUDES_ALL_INPUT }
             : undefined,
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: config.voice } },
           },
-          systemInstruction: config.systemInstruction || config.sessionContext || 'You are a helpful, multimodal AI assistant.',
+          systemInstruction:
+            config.systemInstruction ||
+            config.sessionContext ||
+            'You are a helpful, multimodal AI assistant.',
           tools: tools.length > 0 ? tools : undefined,
           outputAudioTranscription: {},
           inputAudioTranscription: {},
         },
         callbacks: {
-          onopen: () => {
+          onopen: async () => {
             this.onStatusCallback?.('Connected');
-            this.recorder.start((base64Data) => {
-              // Agora this.session ja esta resolvido (nao e mais uma Promise)
-              this.session?.sendRealtimeInput({
-                media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
+
+            // Tenta ligar o microfone — se falhar, avisa mas mantem a sessao viva
+            try {
+              await this.recorder.start((base64Data) => {
+                this.session?.sendRealtimeInput({
+                  media: { data: base64Data, mimeType: 'audio/pcm;rate=16000' },
+                });
               });
-            });
+            } catch (micError: any) {
+              console.error('Mic error:', micError);
+              this.onStatusCallback?.('Conectado (sem microfone)');
+              this.onMessageCallback?.({
+                id: Date.now().toString(),
+                role: 'system',
+                text: `⚠️ ${micError?.message || 'Microfone bloqueado.'} O chat por texto continua funcionando normalmente.`,
+                isMicError: true,
+              });
+            }
           },
+
           onmessage: async (message: LiveServerMessage) => {
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (base64Audio) this.player.play(base64Audio);
@@ -100,7 +122,10 @@ export class LiveSessionManager {
               for (const part of parts) {
                 if (part.text) {
                   this.onMessageCallback?.({
-                    id: Date.now().toString(), role: 'model', text: part.text, isThinking: true
+                    id: Date.now().toString(),
+                    role: 'model',
+                    text: part.text,
+                    isThinking: true,
                   });
                 }
               }
@@ -109,13 +134,20 @@ export class LiveSessionManager {
             const outputTranscription = (message.serverContent as any)?.outputTranscription?.text;
             if (outputTranscription) {
               this.onMessageCallback?.({
-                id: Date.now().toString(), role: 'model', text: outputTranscription, isThinking: false
+                id: Date.now().toString(),
+                role: 'model',
+                text: outputTranscription,
+                isThinking: false,
               });
             }
 
             const inputTranscription = (message.serverContent as any)?.inputTranscription?.text;
             if (inputTranscription) {
-              this.onMessageCallback?.({ id: Date.now().toString(), role: 'user', text: inputTranscription });
+              this.onMessageCallback?.({
+                id: Date.now().toString(),
+                role: 'user',
+                text: inputTranscription,
+              });
             }
 
             if (message.serverContent?.interrupted) this.player.stop();
@@ -126,15 +158,19 @@ export class LiveSessionManager {
               const responses = await Promise.all(
                 functionCalls.map(async (call) => {
                   this.onMessageCallback?.({
-                    id: call.id, role: 'system',
+                    id: call.id,
+                    role: 'system',
                     text: `🔧 Calling tool: **${call.name}**`,
-                    isToolCall: true, toolDetails: { args: call.args }
+                    isToolCall: true,
+                    toolDetails: { args: call.args },
                   });
                   const result = await handleToolCall(call.name, call.args);
                   this.onMessageCallback?.({
-                    id: call.id + '_result', role: 'system',
+                    id: call.id + '_result',
+                    role: 'system',
                     text: `🔧 Tool **${call.name}** completed.`,
-                    isToolCall: true, toolDetails: { args: call.args, result }
+                    isToolCall: true,
+                    toolDetails: { args: call.args, result },
                   });
                   return { id: call.id, name: call.name, response: result };
                 })
@@ -143,15 +179,17 @@ export class LiveSessionManager {
               this.onStatusCallback?.('Connected');
             }
           },
+
           onerror: (error: any) => {
             console.error('Live API Error:', error);
             this.onStatusCallback?.('Error');
             this.disconnect();
           },
+
           onclose: () => {
-            this.onStatusCallback?.('Disconnected');
             this.recorder.stop();
             this.session = null;
+            this.onStatusCallback?.('Disconnected');
           },
         },
       });
@@ -164,12 +202,15 @@ export class LiveSessionManager {
   async sendText(text: string) {
     if (!this.session) return;
     try {
-      // Metodo correto da SDK JS: sendClientContent (nao session.send)
       this.session.sendClientContent({
         turns: [{ role: 'user', parts: [{ text }] }],
         turnComplete: true,
       });
-      this.onMessageCallback?.({ id: Date.now().toString(), role: 'user', text });
+      this.onMessageCallback?.({
+        id: Date.now().toString(),
+        role: 'user',
+        text,
+      });
     } catch (error) {
       console.error('Error sending text:', error);
     }

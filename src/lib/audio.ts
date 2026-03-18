@@ -7,14 +7,27 @@ export class AudioRecorder {
   private workletNode: AudioWorkletNode | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private onDataCallback: ((data: string) => void) | null = null;
-  private isMicMuted: boolean = false;
+  private isMicMuted = false;
 
   async start(onData: (data: string) => void) {
     this.onDataCallback = onData;
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      this.audioContext = new AudioContext({ sampleRate: 16000 });
 
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+      throw new Error(
+        'Microfone indisponivel: a pagina precisa estar em HTTPS para acessar o microfone.'
+      );
+    }
+
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      this.audioContext = new AudioContext({ sampleRate: 16000 });
       await this.audioContext.audioWorklet.addModule(workletUrl);
       this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-processor');
 
@@ -27,29 +40,34 @@ export class AudioRecorder {
 
       this.source = this.audioContext.createMediaStreamSource(this.stream);
       this.source.connect(this.workletNode);
-      // workletNode NAO conecta ao destination — so processa, nao reproduz
-    } catch (error) {
-      console.error('Error starting audio recorder:', error);
+    } catch (error: any) {
+      const name = error?.name || '';
+      if (name === 'NotAllowedError') {
+        throw new Error(
+          'Permissao do microfone negada. Clique no cadeado da barra de endereco, libere o microfone e recarregue a pagina.'
+        );
+      }
+      if (name === 'NotFoundError') {
+        throw new Error('Nenhum microfone encontrado no dispositivo.');
+      }
       throw error;
     }
   }
 
   setMicMuted(muted: boolean) {
     this.isMicMuted = muted;
-    if (this.stream) {
-      this.stream.getAudioTracks().forEach(t => { t.enabled = !muted; });
-    }
+    this.stream?.getAudioTracks().forEach((t) => { t.enabled = !muted; });
   }
 
-  getMicMuted(): boolean { return this.isMicMuted; }
-  isActive(): boolean { return this.stream !== null; }
+  getMicMuted() { return this.isMicMuted; }
+  isActive() { return !!this.stream; }
 
   stop() {
     this.workletNode?.disconnect();
     this.workletNode = null;
     this.source?.disconnect();
     this.source = null;
-    this.stream?.getTracks().forEach(t => t.stop());
+    this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
     this.audioContext?.close();
     this.audioContext = null;
@@ -78,8 +96,8 @@ export class AudioRecorder {
 export class AudioPlayer {
   private audioContext: AudioContext;
   private gainNode: GainNode;
-  private nextPlayTime: number = 0;
-  private isAudioMuted: boolean = false;
+  private nextPlayTime = 0;
+  private isAudioMuted = false;
 
   constructor() {
     this.audioContext = new AudioContext({ sampleRate: 24000 });
@@ -92,7 +110,7 @@ export class AudioPlayer {
     this.gainNode.gain.setTargetAtTime(muted ? 0 : 1, this.audioContext.currentTime, 0.01);
   }
 
-  getAudioMuted(): boolean { return this.isAudioMuted; }
+  getAudioMuted() { return this.isAudioMuted; }
 
   async play(base64Audio: string) {
     try {
