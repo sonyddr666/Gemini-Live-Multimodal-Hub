@@ -75,6 +75,12 @@ export default function App() {
   }, [activeInstructionId]);
 
   const persistHistory = (session: SessionHistory) => {
+    // Nunca salva sessao sem mensagens reais (user ou model)
+    const hasRealMessages = session.messages.some(
+      (m) => (m.role === 'user' || m.role === 'model') && !m.isThinking
+    );
+    if (!hasRealMessages) return;
+
     setHistory((prev) => {
       const next = [...prev];
       const idx = next.findIndex((s) => s.id === session.id);
@@ -97,7 +103,6 @@ export default function App() {
     sessionManagerRef.current = new LiveSessionManager();
     sessionManagerRef.current.setCallbacks(
       (msg) => {
-        // Detecta se o microfone foi bloqueado
         if (msg.isMicError) setMicBlocked(true);
 
         setMessages((prev) => {
@@ -149,6 +154,7 @@ export default function App() {
     if (isConnected) {
       if (currentSessionRef.current) {
         currentSessionRef.current.endedAt = new Date().toISOString();
+        // persistHistory ja ignora sessoes sem mensagens reais
         persistHistory(currentSessionRef.current);
         currentSessionRef.current = null;
       }
@@ -162,6 +168,7 @@ export default function App() {
       const activeInstruction = instructions.find((i) => i.id === activeInstructionId);
       const systemInstruction = activeInstruction?.text || 'Você é um assistente. Responda em português.';
 
+      // Cria a sessao em memoria mas NAO persiste ainda — so salva quando chegar mensagem real
       currentSessionRef.current = {
         id: 'sess_' + Date.now(),
         startedAt: new Date().toISOString(),
@@ -170,7 +177,6 @@ export default function App() {
         voice,
         messages: [],
       };
-      persistHistory(currentSessionRef.current);
 
       await sessionManagerRef.current?.connect({
         voice,
@@ -225,7 +231,6 @@ export default function App() {
           </button>
         </header>
 
-        {/* Banner de microfone bloqueado */}
         {micBlocked && (
           <div className="mx-4 mt-3 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/30 flex items-start gap-3">
             <AlertTriangle className="w-4 h-4 text-yellow-400 mt-0.5 shrink-0" />
@@ -284,7 +289,6 @@ export default function App() {
 
         <div className="p-4 bg-[#1e1e1e] border-t border-white/10">
           <form onSubmit={handleSendText} className="flex gap-2 max-w-4xl mx-auto items-center">
-            {/* Conectar / Desconectar */}
             <button
               type="button"
               onClick={toggleConnection}
@@ -299,7 +303,6 @@ export default function App() {
               {isConnected ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
             </button>
 
-            {/* Mute Mic — só quando conectado e sem erro de permissão */}
             {isConnected && !micBlocked && (
               <button
                 type="button"
@@ -320,7 +323,6 @@ export default function App() {
               </button>
             )}
 
-            {/* Mute Audio Saída */}
             <button
               type="button"
               onClick={toggleAudioOutputMute}
@@ -370,7 +372,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Sidebar */}
       <div className={cn(
         'config-panel w-[340px] bg-[#1e1e1e] border-l border-white/10 overflow-y-auto transition-all duration-300 ease-in-out shrink-0 flex flex-col',
         isSidebarOpen ? 'translate-x-0' : 'translate-x-full hidden'
@@ -482,7 +483,7 @@ export default function App() {
                     <div key={session.id} className="flex items-center justify-between group/item p-2 hover:bg-white/5 rounded-lg transition-colors text-xs">
                       <div className="flex flex-col min-w-0 flex-1">
                         <span className="text-gray-300 truncate">{new Date(session.startedAt).toLocaleString()}</span>
-                        <span className="text-gray-500 truncate">{session.instruction}</span>
+                        <span className="text-gray-500 truncate">{session.instruction} · {session.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')).length} msgs</span>
                       </div>
                       <div className="flex items-center gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity shrink-0 ml-2">
                         <button onClick={() => setViewingSession(session)}
