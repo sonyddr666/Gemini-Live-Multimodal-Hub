@@ -1,5 +1,22 @@
-// @ts-ignore
-import workletUrl from './audio-processor.worklet.ts?url';
+// O worklet e definido como string e carregado via Blob URL
+// Isso evita o AbortError de carregamento de modulo em static sites (Render, Netlify, etc)
+const WORKLET_CODE = `
+class PCMProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const input = inputs[0]?.[0];
+    if (input && input.length > 0) {
+      this.port.postMessage(input);
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-processor', PCMProcessor);
+`;
+
+function createWorkletBlobUrl(): string {
+  const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+  return URL.createObjectURL(blob);
+}
 
 export class AudioRecorder {
   private stream: MediaStream | null = null;
@@ -8,6 +25,7 @@ export class AudioRecorder {
   private source: MediaStreamAudioSourceNode | null = null;
   private onDataCallback: ((data: string) => void) | null = null;
   private isMicMuted = false;
+  private blobUrl: string | null = null;
 
   async start(onData: (data: string) => void) {
     this.onDataCallback = onData;
@@ -28,9 +46,12 @@ export class AudioRecorder {
       });
 
       this.audioContext = new AudioContext({ sampleRate: 16000 });
-      await this.audioContext.audioWorklet.addModule(workletUrl);
-      this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-processor');
 
+      // Carrega o worklet via Blob URL para evitar problemas com static hosting
+      this.blobUrl = createWorkletBlobUrl();
+      await this.audioContext.audioWorklet.addModule(this.blobUrl);
+
+      this.workletNode = new AudioWorkletNode(this.audioContext, 'pcm-processor');
       this.workletNode.port.onmessage = (e: MessageEvent<Float32Array>) => {
         if (this.isMicMuted) return;
         const pcm16 = this.floatTo16BitPCM(e.data);
@@ -71,6 +92,10 @@ export class AudioRecorder {
     this.stream = null;
     this.audioContext?.close();
     this.audioContext = null;
+    if (this.blobUrl) {
+      URL.revokeObjectURL(this.blobUrl);
+      this.blobUrl = null;
+    }
     this.onDataCallback = null;
     this.isMicMuted = false;
   }
@@ -114,6 +139,9 @@ export class AudioPlayer {
 
   async play(base64Audio: string) {
     try {
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume();
+      }
       const arrayBuffer = this.base64ToArrayBuffer(base64Audio);
       const int16Array = new Int16Array(arrayBuffer);
       const float32Array = new Float32Array(int16Array.length);
