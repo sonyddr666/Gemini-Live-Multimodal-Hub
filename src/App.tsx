@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Settings, Mic, MicOff, Send, AudioLines, Sparkles, Cpu, Edit2, Trash2, Plus, Eye, Download, Volume2, VolumeX, AlertTriangle, RotateCcw, PhoneOff, MessageSquare } from 'lucide-react';
+import { Settings, Mic, MicOff, Send, AudioLines, Sparkles, Cpu, Edit2, Trash2, Plus, Eye, Download, Volume2, VolumeX, AlertTriangle, RotateCcw, PhoneOff, MessageSquare, Loader2, RefreshCw } from 'lucide-react';
 import { cn } from './lib/utils';
 import { LiveSessionManager, Message, DroppedSession } from './lib/live';
-import { ChatSessionManager, setTTSEnabled, setTTSRate, cancelTTS } from './lib/chat';
+import { ChatSessionManager, setTTSEnabled, setTTSSecretKey, setTTSVoiceId, setTTSModel, cancelTTS } from './lib/chat';
+import type { TTSModel, VoiceInfo } from './lib/inworldTTS';
+import { listVoices, DEFAULT_VOICE_ID } from './lib/inworldTTS';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import ReactMarkdown from 'react-markdown';
 
@@ -11,36 +13,17 @@ const ACTIVE_SESSION_KEY  = 'livego_active_session';
 const MIN_SESSION_MS      = 5000;
 const RECONNECT_COOLDOWN  = 3000;
 
-// Modelos native-audio → usa LiveSessionManager (WebSocket + voz nativa)
-// Qualquer outro → usa ChatSessionManager (REST + Chrome STT + speechSynthesis)
-function isLiveModel(model: string) {
-  return model.includes('native-audio');
-}
+function isLiveModel(model: string) { return model.includes('native-audio'); }
 
-interface Instruction {
-  id: string;
-  name: string;
-  text: string;
-}
-
+interface Instruction { id: string; name: string; text: string; }
 interface SessionHistory {
-  id: string;
-  startedAt: string;
-  endedAt?: string;
-  instruction: string;
-  model: string;
-  voice: string;
-  messages: Message[];
-  wasDropped?: boolean;
-  mode?: 'live' | 'text';
+  id: string; startedAt: string; endedAt?: string;
+  instruction: string; model: string; voice: string;
+  messages: Message[]; wasDropped?: boolean; mode?: 'live' | 'text';
 }
 
 export default function App() {
-  return (
-    <ErrorBoundary>
-      <AppInner />
-    </ErrorBoundary>
-  );
+  return <ErrorBoundary><AppInner /></ErrorBoundary>;
 }
 
 function AppInner() {
@@ -53,22 +36,22 @@ function AppInner() {
   const [audioOutputMuted, setAudioOutputMuted] = useState(false);
   const [micBlocked, setMicBlocked] = useState(false);
   const [sessionDropped, setSessionDropped] = useState(false);
-  const [useConversationContext, setUseConversationContext] = useState(() => {
-    return localStorage.getItem('livego_use_context') === 'true';
-  });
-  const [ttsEnabled, setTtsEnabled] = useState(() =>
-    localStorage.getItem('livego_tts_enabled') !== 'false'
-  );
-  const [ttsRate, setTtsRate] = useState(() =>
-    parseFloat(localStorage.getItem('livego_tts_rate') || '1')
-  );
+
+  const [useConversationContext, setUseConversationContext] = useState(() => localStorage.getItem('livego_use_context') === 'true');
+  const [ttsEnabled, setTtsEnabled] = useState(() => localStorage.getItem('livego_tts_enabled') !== 'false');
+
+  // Inworld TTS settings
+  const [ttsSecretKey, setTtsSecretKey] = useState(() => localStorage.getItem('livego_tts_secret_key') || '');
+  const [ttsVoiceId, setTtsVoiceId] = useState(() => localStorage.getItem('livego_tts_voice_id') || DEFAULT_VOICE_ID);
+  const [ttsModel, setTtsModelState] = useState<TTSModel>(() => (localStorage.getItem('livego_tts_model') as TTSModel) || 'inworld-tts-1.5-mini');
+  const [availableVoices, setAvailableVoices] = useState<VoiceInfo[]>([]);
+  const [loadingVoices, setLoadingVoices] = useState(false);
+  const [voicesError, setVoicesError] = useState('');
 
   const lastDisconnectRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
 
-  const [model, setModel] = useState(
-    () => localStorage.getItem('livego_model') || 'gemini-2.5-flash-native-audio-preview-12-2025'
-  );
+  const [model, setModel] = useState(() => localStorage.getItem('livego_model') || 'gemini-2.5-flash-native-audio-preview-12-2025');
   const [voice, setVoice] = useState('Zephyr');
   const [mediaResolution, setMediaResolution] = useState('258 tokens / image');
   const [turnCoverage, setTurnCoverage] = useState(false);
@@ -90,14 +73,8 @@ function AppInner() {
       { id: 'uuid3', name: 'Suporte técnico', text: 'Você é um especialista em suporte técnico...' },
     ];
   });
-  const [activeInstructionId, setActiveInstructionId] = useState<string>(() => {
-    return localStorage.getItem('livego_active_instruction') || 'uuid1';
-  });
-
-  const [history, setHistory] = useState<SessionHistory[]>(() => {
-    const saved = localStorage.getItem('livego_history');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [activeInstructionId, setActiveInstructionId] = useState<string>(() => localStorage.getItem('livego_active_instruction') || 'uuid1');
+  const [history, setHistory] = useState<SessionHistory[]>(() => { const s = localStorage.getItem('livego_history'); return s ? JSON.parse(s) : []; });
   const currentSessionRef = useRef<SessionHistory | null>(null);
   const [editingInstruction, setEditingInstruction] = useState<Instruction | null>(null);
   const [viewingSession, setViewingSession] = useState<SessionHistory | null>(null);
@@ -107,30 +84,19 @@ function AppInner() {
 
   const activeMode = isLiveModel(model) ? 'live' : 'text';
 
-  // Detecta sessao abandonada no mount
+  // Detecta sessao abandonada
   useEffect(() => {
     try {
       const activeRaw = localStorage.getItem(ACTIVE_SESSION_KEY);
       if (activeRaw && !localStorage.getItem(DROPPED_SESSION_KEY)) {
         const active = JSON.parse(activeRaw);
-        if (active.timestamp && Date.now() - active.timestamp < 24 * 60 * 60 * 1000) {
-          const dropped: DroppedSession = {
-            transcript: active.transcript || '',
-            timestamp: active.timestamp,
-            startTime: active.startTime || active.timestamp,
-            closeCode: 0,
-            closeReason: 'App fechado durante sessão',
-          };
-          localStorage.setItem(DROPPED_SESSION_KEY, JSON.stringify(dropped));
+        if (active.timestamp && Date.now() - active.timestamp < 86400000) {
+          localStorage.setItem(DROPPED_SESSION_KEY, JSON.stringify({ transcript: active.transcript || '', timestamp: active.timestamp, startTime: active.startTime || active.timestamp, closeCode: 0, closeReason: 'App fechado durante sessão' }));
           setSessionDropped(true);
         }
         localStorage.removeItem(ACTIVE_SESSION_KEY);
-      } else if (localStorage.getItem(DROPPED_SESSION_KEY)) {
-        setSessionDropped(true);
-      }
-    } catch (e) {
-      console.warn('[App] Failed to check active session:', e);
-    }
+      } else if (localStorage.getItem(DROPPED_SESSION_KEY)) setSessionDropped(true);
+    } catch (e) { console.warn('[App] session check:', e); }
   }, []);
 
   useEffect(() => { localStorage.setItem('livego_instructions', JSON.stringify(instructions)); }, [instructions]);
@@ -138,242 +104,145 @@ function AppInner() {
   useEffect(() => { localStorage.setItem('livego_use_context', String(useConversationContext)); }, [useConversationContext]);
   useEffect(() => { localStorage.setItem('livego_model', model); }, [model]);
   useEffect(() => { localStorage.setItem('livego_tts_enabled', String(ttsEnabled)); setTTSEnabled(ttsEnabled); }, [ttsEnabled]);
-  useEffect(() => { localStorage.setItem('livego_tts_rate', String(ttsRate)); setTTSRate(ttsRate); }, [ttsRate]);
+  useEffect(() => { localStorage.setItem('livego_tts_secret_key', ttsSecretKey); setTTSSecretKey(ttsSecretKey); }, [ttsSecretKey]);
+  useEffect(() => { localStorage.setItem('livego_tts_voice_id', ttsVoiceId); setTTSVoiceId(ttsVoiceId); }, [ttsVoiceId]);
+  useEffect(() => { localStorage.setItem('livego_tts_model', ttsModel); setTTSModel(ttsModel); }, [ttsModel]);
+
+  const handleListVoices = async () => {
+    if (!ttsSecretKey) { setVoicesError('Insira a Secret Key primeiro.'); return; }
+    setLoadingVoices(true); setVoicesError('');
+    const voices = await listVoices(ttsSecretKey);
+    setLoadingVoices(false);
+    if (!voices) { setVoicesError('Erro ao buscar vozes. Verifique a chave.'); return; }
+    setAvailableVoices(voices);
+    if (voices.length > 0 && !ttsVoiceId) setTtsVoiceId(voices[0].voiceId);
+  };
 
   const persistHistory = (session: SessionHistory) => {
-    const hasRealMessages = session.messages.some(
-      (m) => (m.role === 'user' || m.role === 'model') && !m.isThinking
-    );
-    if (!hasRealMessages) return;
-    setHistory((prev) => {
+    const hasReal = session.messages.some(m => (m.role === 'user' || m.role === 'model') && !m.isThinking);
+    if (!hasReal) return;
+    setHistory(prev => {
       const next = [...prev];
-      const idx = next.findIndex((s) => s.id === session.id);
-      if (idx >= 0) next[idx] = session;
-      else next.unshift(session);
+      const idx = next.findIndex(s => s.id === session.id);
+      if (idx >= 0) next[idx] = session; else next.unshift(session);
       localStorage.setItem('livego_history', JSON.stringify(next));
       return next;
     });
   };
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  useEffect(() => {
-    sessionManagerRef.current?.setMuted(!playAudio);
-  }, [playAudio]);
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useEffect(() => { sessionManagerRef.current?.setMuted(!playAudio); }, [playAudio]);
 
   const handleUnexpectedDisconnect = (data: { transcript: string; closeCode: number; closeReason: string }) => {
     const durationMs = Date.now() - startTimeRef.current;
     lastDisconnectRef.current = Date.now();
-    if (durationMs < MIN_SESSION_MS) {
-      localStorage.removeItem(DROPPED_SESSION_KEY);
-      localStorage.removeItem(ACTIVE_SESSION_KEY);
-      setSessionDropped(false);
-      return;
-    }
+    if (durationMs < MIN_SESSION_MS) { localStorage.removeItem(DROPPED_SESSION_KEY); localStorage.removeItem(ACTIVE_SESSION_KEY); setSessionDropped(false); return; }
     if (data.transcript.trim().length > 0) {
-      const dropped: DroppedSession = {
-        transcript: data.transcript,
-        timestamp: Date.now(),
-        startTime: startTimeRef.current,
-        closeCode: data.closeCode,
-        closeReason: data.closeReason,
-      };
-      localStorage.setItem(DROPPED_SESSION_KEY, JSON.stringify(dropped));
+      localStorage.setItem(DROPPED_SESSION_KEY, JSON.stringify({ transcript: data.transcript, timestamp: Date.now(), startTime: startTimeRef.current, closeCode: data.closeCode, closeReason: data.closeReason } as DroppedSession));
       localStorage.removeItem(ACTIVE_SESSION_KEY);
       setSessionDropped(true);
     }
   };
 
-  // Inicializa os dois managers uma vez
   useEffect(() => {
     sessionManagerRef.current = new LiveSessionManager();
     chatManagerRef.current = new ChatSessionManager();
 
     const onMsg = (msg: Message) => {
       if (msg.isMicError) setMicBlocked(true);
-      setMessages((prev) => {
+      setMessages(prev => {
         let next: Message[];
-        if (prev.length === 0) {
-          next = [msg];
-        } else if (msg.role === 'system' || msg.isToolCall) {
-          next = [...prev, msg];
-        } else {
+        if (prev.length === 0) { next = [msg]; }
+        else if (msg.role === 'system' || msg.isToolCall) { next = [...prev, msg]; }
+        else {
           let targetIndex = -1;
           for (let i = prev.length - 1; i >= 0; i--) {
             if (prev[i].role !== msg.role) break;
             if (prev[i].isThinking === msg.isThinking && !prev[i].isToolCall) {
               if (prev[i].id === msg.id) { targetIndex = i; break; }
-              // Live mode sem id fixo
               if (msg.role !== 'user') { targetIndex = i; break; }
             }
           }
           if (targetIndex !== -1) {
             next = [...prev];
-            next[targetIndex] = { ...next[targetIndex], text: next[targetIndex].text + (msg.id === next[targetIndex].id ? msg.text.slice(next[targetIndex].text.length) : msg.text) };
-          } else {
-            next = [...prev, msg];
-          }
+            const existing = next[targetIndex];
+            next[targetIndex] = { ...existing, text: existing.id === msg.id ? msg.text : existing.text + msg.text.slice(existing.text.length) };
+          } else { next = [...prev, msg]; }
         }
-        if (currentSessionRef.current) {
-          currentSessionRef.current.messages = next;
-          persistHistory(currentSessionRef.current);
-        }
+        if (currentSessionRef.current) { currentSessionRef.current.messages = next; persistHistory(currentSessionRef.current); }
         return next;
       });
     };
 
-    const onStatus = (newStatus: string) => {
-      setStatus(newStatus);
-      if (newStatus === 'Connected' || newStatus.startsWith('Conectado')) {
-        setIsConnected(true);
-      }
-      if (newStatus === 'Disconnected' || newStatus === 'Connection Failed') {
-        setIsConnected(false);
-        setMicMuted(false);
-        setAudioOutputMuted(false);
-        setMicBlocked(false);
-      }
+    const onStatus = (s: string) => {
+      setStatus(s);
+      if (s === 'Connected' || s.startsWith('Conectado')) setIsConnected(true);
+      if (s === 'Disconnected' || s === 'Connection Failed') { setIsConnected(false); setMicMuted(false); setAudioOutputMuted(false); setMicBlocked(false); }
     };
 
     sessionManagerRef.current.setCallbacks(onMsg, onStatus);
     chatManagerRef.current.setConfig({
-      model,
-      systemInstruction: '',
-      thinkingMode,
-      thinkingBudget,
-      grounding: groundingSearch,
-      functionCalling,
-      ttsEnabled,
-      ttsRate,
-      onMessage: onMsg,
-      onStatus,
+      model, systemInstruction: '', thinkingMode, thinkingBudget,
+      grounding: groundingSearch, functionCalling,
+      ttsEnabled, ttsSecretKey, ttsVoiceId, ttsModel,
+      onMessage: onMsg, onStatus,
     });
 
-    return () => {
-      sessionManagerRef.current?.disconnect();
-      chatManagerRef.current?.stop();
-    };
+    return () => { sessionManagerRef.current?.disconnect(); chatManagerRef.current?.stop(); };
   }, []);
 
-  const buildSystemInstruction = (baseInstruction: string): string => {
-    let instruction = baseInstruction;
+  const buildSystemInstruction = (base: string): string => {
+    let instruction = base;
     try {
       const droppedRaw = localStorage.getItem(DROPPED_SESSION_KEY);
       if (droppedRaw) {
         const dropped: DroppedSession = JSON.parse(droppedRaw);
-        if (dropped.transcript) {
-          instruction += `\n\n[CONTEXTO DA SESSÃO ANTERIOR INTERROMPIDA]:\n${dropped.transcript.substring(0, 2000)}\n\nContinue a conversa naturalmente de onde parou. Não mencione detalhes técnicos da interrupção.`;
-        }
-        localStorage.removeItem(DROPPED_SESSION_KEY);
-        localStorage.removeItem(ACTIVE_SESSION_KEY);
-        setSessionDropped(false);
+        if (dropped.transcript) instruction += `\n\n[CONTEXTO DA SESSÃO ANTERIOR INTERROMPIDA]:\n${dropped.transcript.substring(0, 2000)}\n\nContinue a conversa naturalmente de onde parou.`;
+        localStorage.removeItem(DROPPED_SESSION_KEY); localStorage.removeItem(ACTIVE_SESSION_KEY); setSessionDropped(false);
         return instruction;
       }
     } catch (e) { /* ignore */ }
-
     if (useConversationContext && history.length > 0) {
-      const recentMessages = history
-        .slice(0, 3)
-        .flatMap(s => s.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')))
-        .slice(-20)
-        .map(m => `${m.role === 'user' ? 'Você' : 'Gemini'}: ${m.text}`)
-        .join('\n');
-      if (recentMessages) {
-        instruction += `\n\n[Contexto de conversas anteriores]:\n${recentMessages}`;
-      }
+      const recent = history.slice(0, 3).flatMap(s => s.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model'))).slice(-20).map(m => `${m.role === 'user' ? 'Você' : 'Gemini'}: ${m.text}`).join('\n');
+      if (recent) instruction += `\n\n[Contexto de conversas anteriores]:\n${recent}`;
     }
     return instruction;
   };
 
   const handleConnect = async () => {
     const timeSince = Date.now() - lastDisconnectRef.current;
-    if (lastDisconnectRef.current > 0 && timeSince < RECONNECT_COOLDOWN) {
-      await new Promise(r => setTimeout(r, RECONNECT_COOLDOWN - timeSince));
-    }
-
-    setMessages([]);
-    setMicMuted(false);
-    setAudioOutputMuted(false);
-    setMicBlocked(false);
+    if (lastDisconnectRef.current > 0 && timeSince < RECONNECT_COOLDOWN) await new Promise(r => setTimeout(r, RECONNECT_COOLDOWN - timeSince));
+    setMessages([]); setMicMuted(false); setAudioOutputMuted(false); setMicBlocked(false);
     startTimeRef.current = Date.now();
-
-    const activeInstruction = instructions.find((i) => i.id === activeInstructionId);
-    const baseInstruction = activeInstruction?.text || 'Você é um assistente. Responda em português.';
-    const systemInstruction = buildSystemInstruction(baseInstruction);
-
-    currentSessionRef.current = {
-      id: 'sess_' + Date.now(),
-      startedAt: new Date().toISOString(),
-      instruction: activeInstruction?.name || 'Unknown',
-      model,
-      voice,
-      messages: [],
-      mode: activeMode,
-    };
+    const activeInstruction = instructions.find(i => i.id === activeInstructionId);
+    const systemInstruction = buildSystemInstruction(activeInstruction?.text || 'Você é um assistente. Responda em português.');
+    currentSessionRef.current = { id: 'sess_' + Date.now(), startedAt: new Date().toISOString(), instruction: activeInstruction?.name || 'Unknown', model, voice, messages: [], mode: activeMode };
 
     if (activeMode === 'live') {
-      await sessionManagerRef.current?.connect({
-        voice,
-        thinkingMode,
-        grounding: groundingSearch,
-        functionCalling,
-        sessionContext,
-        mediaResolution,
-        turnCoverage,
-        playAudio,
-        systemInstruction,
-        useConversationContext,
-        onUnexpectedDisconnect: handleUnexpectedDisconnect,
-      });
+      await sessionManagerRef.current?.connect({ voice, thinkingMode, grounding: groundingSearch, functionCalling, sessionContext, mediaResolution, turnCoverage, playAudio, systemInstruction, useConversationContext, onUnexpectedDisconnect: handleUnexpectedDisconnect });
     } else {
-      // Modo texto — atualiza config com instruction e modelo corretos
       chatManagerRef.current?.setConfig({
-        model,
-        systemInstruction,
-        thinkingMode,
-        thinkingBudget,
-        grounding: groundingSearch,
-        functionCalling,
-        ttsEnabled,
-        ttsRate,
+        model, systemInstruction, thinkingMode, thinkingBudget,
+        grounding: groundingSearch, functionCalling,
+        ttsEnabled, ttsSecretKey, ttsVoiceId, ttsModel,
         onMessage: (msg) => {
           if (msg.isMicError) setMicBlocked(true);
-          setMessages((prev) => {
+          setMessages(prev => {
             let next: Message[];
-            if (prev.length === 0) {
-              next = [msg];
-            } else if (msg.role === 'system' || msg.isToolCall) {
-              next = [...prev, msg];
-            } else {
-              // Atualiza mensagem existente pelo id (streaming)
-              const idx = prev.findLastIndex(
-                (m) => m.id === msg.id && m.role === msg.role
-              );
-              if (idx !== -1) {
-                next = [...prev];
-                next[idx] = msg;
-              } else {
-                next = [...prev, msg];
-              }
+            if (prev.length === 0) { next = [msg]; }
+            else if (msg.role === 'system' || msg.isToolCall) { next = [...prev, msg]; }
+            else {
+              const idx = prev.findLastIndex(m => m.id === msg.id && m.role === msg.role);
+              if (idx !== -1) { next = [...prev]; next[idx] = msg; } else { next = [...prev, msg]; }
             }
-            if (currentSessionRef.current) {
-              currentSessionRef.current.messages = next;
-              persistHistory(currentSessionRef.current);
-            }
+            if (currentSessionRef.current) { currentSessionRef.current.messages = next; persistHistory(currentSessionRef.current); }
             return next;
           });
         },
-        onStatus: (newStatus) => {
-          setStatus(newStatus);
-          if (newStatus === 'Connected' || newStatus.startsWith('Conectado')) setIsConnected(true);
-          if (newStatus === 'Disconnected') {
-            setIsConnected(false);
-            setMicMuted(false);
-            setAudioOutputMuted(false);
-            setMicBlocked(false);
-          }
+        onStatus: (s) => {
+          setStatus(s);
+          if (s === 'Connected' || s.startsWith('Conectado')) setIsConnected(true);
+          if (s === 'Disconnected') { setIsConnected(false); setMicMuted(false); setAudioOutputMuted(false); setMicBlocked(false); }
         },
       });
       chatManagerRef.current?.start();
@@ -381,55 +250,32 @@ function AppInner() {
   };
 
   const handleEndCall = async () => {
-    if (currentSessionRef.current) {
-      currentSessionRef.current.endedAt = new Date().toISOString();
-      persistHistory(currentSessionRef.current);
-      currentSessionRef.current = null;
-    }
-    localStorage.removeItem(ACTIVE_SESSION_KEY);
-    localStorage.removeItem(DROPPED_SESSION_KEY);
-    setSessionDropped(false);
+    if (currentSessionRef.current) { currentSessionRef.current.endedAt = new Date().toISOString(); persistHistory(currentSessionRef.current); currentSessionRef.current = null; }
+    localStorage.removeItem(ACTIVE_SESSION_KEY); localStorage.removeItem(DROPPED_SESSION_KEY); setSessionDropped(false);
     cancelTTS();
-    if (activeMode === 'live') {
-      await sessionManagerRef.current?.disconnect();
-    } else {
-      chatManagerRef.current?.stop();
-    }
+    if (activeMode === 'live') await sessionManagerRef.current?.disconnect();
+    else chatManagerRef.current?.stop();
   };
 
   const toggleMicMute = () => {
     if (!isConnected || micBlocked) return;
-    const newMuted = !micMuted;
-    setMicMuted(newMuted);
-    if (activeMode === 'live') {
-      sessionManagerRef.current?.setMicMuted(newMuted);
-    } else {
-      chatManagerRef.current?.setMicMuted(newMuted);
-    }
+    const newMuted = !micMuted; setMicMuted(newMuted);
+    if (activeMode === 'live') sessionManagerRef.current?.setMicMuted(newMuted);
+    else chatManagerRef.current?.setMicMuted(newMuted);
   };
 
   const toggleAudioOutputMute = () => {
-    const newMuted = !audioOutputMuted;
-    setAudioOutputMuted(newMuted);
-    if (activeMode === 'live') {
-      sessionManagerRef.current?.setAudioOutputMuted(newMuted);
-    } else {
-      setTtsEnabled(!newMuted);
-      setTTSEnabled(!newMuted);
-      if (newMuted) cancelTTS();
-    }
+    const newMuted = !audioOutputMuted; setAudioOutputMuted(newMuted);
+    if (activeMode === 'live') sessionManagerRef.current?.setAudioOutputMuted(newMuted);
+    else { setTtsEnabled(!newMuted); setTTSEnabled(!newMuted); if (newMuted) cancelTTS(); }
   };
 
   const handleSendText = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputText.trim() || !isConnected) return;
-    const text = inputText;
-    setInputText('');
-    if (activeMode === 'live') {
-      await sessionManagerRef.current?.sendText(text);
-    } else {
-      await chatManagerRef.current?.sendMessage(text);
-    }
+    const text = inputText; setInputText('');
+    if (activeMode === 'live') await sessionManagerRef.current?.sendText(text);
+    else await chatManagerRef.current?.sendMessage(text);
   };
 
   return (
@@ -439,19 +285,8 @@ function AppInner() {
           <div className="flex items-center gap-2">
             <Sparkles className="w-5 h-5 text-blue-400" />
             <h1 className="font-medium text-gray-100">Gemini Live Hub</h1>
-            <span className={cn(
-              'ml-1 px-2 py-0.5 rounded-full text-xs font-medium',
-              isConnected ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'
-            )}>
-              {status}
-            </span>
-            {/* Badge de modo */}
-            <span className={cn(
-              'px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wide',
-              activeMode === 'live'
-                ? 'bg-purple-500/20 text-purple-400'
-                : 'bg-cyan-500/20 text-cyan-400'
-            )}>
+            <span className={cn('ml-1 px-2 py-0.5 rounded-full text-xs font-medium', isConnected ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400')}>{status}</span>
+            <span className={cn('px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wide', activeMode === 'live' ? 'bg-purple-500/20 text-purple-400' : 'bg-cyan-500/20 text-cyan-400')}>
               {activeMode === 'live' ? '⚡ Live' : '💬 Texto'}
             </span>
           </div>
@@ -463,40 +298,23 @@ function AppInner() {
         {sessionDropped && !isConnected && (
           <div className="mx-4 mt-3 px-4 py-3 rounded-xl bg-blue-500/10 border border-blue-500/30 flex items-start gap-3">
             <RotateCcw className="w-4 h-4 text-blue-400 mt-0.5 shrink-0" />
-            <div className="text-sm text-blue-300 flex-1">
-              <span className="font-medium">Sessão anterior interrompida.</span>{' '}
-              Ao reconectar, o contexto será reinjetado automaticamente.
-            </div>
-            <button
-              onClick={() => { localStorage.removeItem(DROPPED_SESSION_KEY); setSessionDropped(false); }}
-              className="text-blue-400/60 hover:text-blue-300 text-xs shrink-0"
-            >Ignorar</button>
+            <div className="text-sm text-blue-300 flex-1"><span className="font-medium">Sessão anterior interrompida.</span>{' '}Ao reconectar, o contexto será reinjetado automaticamente.</div>
+            <button onClick={() => { localStorage.removeItem(DROPPED_SESSION_KEY); setSessionDropped(false); }} className="text-blue-400/60 hover:text-blue-300 text-xs shrink-0">Ignorar</button>
           </div>
         )}
 
         {micBlocked && (
           <div className="mx-4 mt-3 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/30 flex items-start gap-3">
             <AlertTriangle className="w-4 h-4 text-yellow-400 mt-0.5 shrink-0" />
-            <div className="text-sm text-yellow-300">
-              <span className="font-medium">Microfone bloqueado.</span>{' '}
-              {activeMode === 'live'
-                ? 'Clique no 🔒 na barra de endereço, permita o microfone e recarregue a página.'
-                : 'Permita o microfone nas configurações do browser. O chat por texto continua funcionando.'}
-            </div>
+            <div className="text-sm text-yellow-300"><span className="font-medium">Microfone bloqueado.</span>{' '}{activeMode === 'live' ? 'Clique no 🔒 na barra de endereço, permita o microfone e recarregue a página.' : 'Permita o microfone nas configurações do browser. O chat por texto continua funcionando.'}</div>
           </div>
         )}
 
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
           {messages.length === 0 && !isConnected && (
             <div className="h-full flex flex-col items-center justify-center text-gray-500 space-y-4">
-              {activeMode === 'live'
-                ? <AudioLines className="w-16 h-16 opacity-20" />
-                : <MessageSquare className="w-16 h-16 opacity-20" />}
-              <p>
-                {activeMode === 'live'
-                  ? 'Conecte e comece a falar, ou escreva uma mensagem.'
-                  : `Modo Texto ativo (${model}). Conecte para começar.`}
-              </p>
+              {activeMode === 'live' ? <AudioLines className="w-16 h-16 opacity-20" /> : <MessageSquare className="w-16 h-16 opacity-20" />}
+              <p>{activeMode === 'live' ? 'Conecte e comece a falar, ou escreva uma mensagem.' : `Modo Texto ativo (${model}). Conecte para começar.`}</p>
             </div>
           )}
           {messages.map((msg, i) => {
@@ -509,28 +327,15 @@ function AppInner() {
                   </summary>
                   <div className="mt-3 text-left border-t border-white/10 pt-3">
                     <ReactMarkdown>{msg.text}</ReactMarkdown>
-                    {msg.toolDetails && (
-                      <pre className="mt-2 overflow-x-auto bg-black/20 rounded p-2 text-xs text-gray-400 whitespace-pre-wrap">
-                        {JSON.stringify(msg.toolDetails, null, 2)}
-                      </pre>
-                    )}
+                    {msg.toolDetails && <pre className="mt-2 overflow-x-auto bg-black/20 rounded p-2 text-xs text-gray-400 whitespace-pre-wrap">{JSON.stringify(msg.toolDetails, null, 2)}</pre>}
                   </div>
                 </details>
               );
             }
             return (
-              <div key={i} className={cn(
-                'max-w-[80%] rounded-2xl p-4',
-                msg.role === 'user'
-                  ? 'bg-blue-600/20 text-blue-100 ml-auto rounded-tr-sm'
-                  : 'bg-white/5 text-gray-200 mr-auto rounded-tl-sm'
-              )}>
-                <div className="text-xs opacity-50 mb-1 uppercase tracking-wider font-semibold">
-                  {msg.role === 'user' ? 'Você' : 'Gemini'}
-                </div>
-                <div className="prose prose-invert prose-sm max-w-none">
-                  <ReactMarkdown>{msg.text}</ReactMarkdown>
-                </div>
+              <div key={i} className={cn('max-w-[80%] rounded-2xl p-4', msg.role === 'user' ? 'bg-blue-600/20 text-blue-100 ml-auto rounded-tr-sm' : 'bg-white/5 text-gray-200 mr-auto rounded-tl-sm')}>
+                <div className="text-xs opacity-50 mb-1 uppercase tracking-wider font-semibold">{msg.role === 'user' ? 'Você' : 'Gemini'}</div>
+                <div className="prose prose-invert prose-sm max-w-none"><ReactMarkdown>{msg.text}</ReactMarkdown></div>
               </div>
             );
           })}
@@ -539,94 +344,42 @@ function AppInner() {
 
         <div className="p-4 bg-[#1e1e1e] border-t border-white/10">
           <form onSubmit={handleSendText} className="flex gap-2 max-w-4xl mx-auto items-center">
-
             {!isConnected && (
-              <button
-                type="button"
-                onClick={handleConnect}
-                title="Conectar"
-                className="p-3 rounded-xl flex items-center justify-center transition-all shrink-0 bg-blue-600 text-white hover:bg-blue-700"
-              >
+              <button type="button" onClick={handleConnect} title="Conectar" className="p-3 rounded-xl flex items-center justify-center transition-all shrink-0 bg-blue-600 text-white hover:bg-blue-700">
                 <Mic className="w-5 h-5" />
               </button>
             )}
-
             {isConnected && (
               <>
                 {!micBlocked && (
-                  <button
-                    type="button"
-                    onClick={toggleMicMute}
-                    title={micMuted ? 'Retomar microfone' : 'Pausar microfone'}
-                    className={cn(
-                      'p-3 rounded-xl flex items-center justify-center transition-all shrink-0 relative',
-                      micMuted
-                        ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 ring-1 ring-amber-500/40'
-                        : 'bg-green-500/20 text-green-400 hover:bg-green-500/30 ring-1 ring-green-500/30'
-                    )}
-                  >
+                  <button type="button" onClick={toggleMicMute} title={micMuted ? 'Retomar microfone' : 'Pausar microfone'}
+                    className={cn('p-3 rounded-xl flex items-center justify-center transition-all shrink-0 relative', micMuted ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 ring-1 ring-amber-500/40' : 'bg-green-500/20 text-green-400 hover:bg-green-500/30 ring-1 ring-green-500/30')}>
                     {micMuted ? <MicOff className="w-5 h-5" /> : <Mic className="w-5 h-5" />}
-                    <span className={cn(
-                      'absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full',
-                      micMuted ? 'bg-amber-400' : 'bg-green-400 animate-pulse'
-                    )} />
+                    <span className={cn('absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full', micMuted ? 'bg-amber-400' : 'bg-green-400 animate-pulse')} />
                   </button>
                 )}
-
-                <button
-                  type="button"
-                  onClick={toggleAudioOutputMute}
-                  title={audioOutputMuted ? 'Ligar áudio' : 'Silenciar áudio'}
-                  className={cn(
-                    'p-3 rounded-xl flex items-center justify-center transition-all shrink-0',
-                    audioOutputMuted
-                      ? 'bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 ring-1 ring-orange-500/40'
-                      : 'bg-white/5 text-gray-300 hover:bg-white/10'
-                  )}
-                >
+                <button type="button" onClick={toggleAudioOutputMute} title={audioOutputMuted ? 'Ligar áudio' : 'Silenciar áudio'}
+                  className={cn('p-3 rounded-xl flex items-center justify-center transition-all shrink-0', audioOutputMuted ? 'bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 ring-1 ring-orange-500/40' : 'bg-white/5 text-gray-300 hover:bg-white/10')}>
                   {audioOutputMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
                 </button>
-
-                <button
-                  type="button"
-                  onClick={handleEndCall}
-                  title="Encerrar sessão"
-                  className="p-3 rounded-xl flex items-center justify-center transition-all shrink-0 bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/30"
-                >
+                <button type="button" onClick={handleEndCall} title="Encerrar sessão" className="p-3 rounded-xl flex items-center justify-center transition-all shrink-0 bg-red-500/20 text-red-400 hover:bg-red-500/30 ring-1 ring-red-500/30">
                   <PhoneOff className="w-4 h-4" />
                 </button>
               </>
             )}
-
             <div className="flex-1 relative">
-              <input
-                type="text"
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                placeholder={isConnected ? 'Digite uma mensagem...' : 'Conecte para começar'}
-                disabled={!isConnected}
-                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 disabled:opacity-50"
-              />
-              <button
-                type="submit"
-                disabled={!inputText.trim() || !isConnected}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-gray-400 hover:text-white disabled:opacity-50 transition-colors"
-              >
+              <input type="text" value={inputText} onChange={e => setInputText(e.target.value)}
+                placeholder={isConnected ? 'Digite uma mensagem...' : 'Conecte para começar'} disabled={!isConnected}
+                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 disabled:opacity-50" />
+              <button type="submit" disabled={!inputText.trim() || !isConnected} className="absolute right-2 top-1/2 -translate-y-1/2 p-2 text-gray-400 hover:text-white disabled:opacity-50 transition-colors">
                 <Send className="w-4 h-4" />
               </button>
             </div>
           </form>
-
           {isConnected && (
             <div className="flex gap-2 max-w-4xl mx-auto mt-2 px-1 items-start">
-              {!micBlocked && (
-                <span className="text-[10px] text-gray-600 w-[46px] text-center leading-tight">
-                  {micMuted ? 'mic pausado' : 'mic ativo'}
-                </span>
-              )}
-              <span className="text-[10px] text-gray-600 w-[46px] text-center leading-tight">
-                {audioOutputMuted ? 'som off' : 'som on'}
-              </span>
+              {!micBlocked && <span className="text-[10px] text-gray-600 w-[46px] text-center leading-tight">{micMuted ? 'mic pausado' : 'mic ativo'}</span>}
+              <span className="text-[10px] text-gray-600 w-[46px] text-center leading-tight">{audioOutputMuted ? 'som off' : 'som on'}</span>
               <span className="text-[10px] text-red-800 w-[46px] text-center leading-tight">encerrar</span>
             </div>
           )}
@@ -634,15 +387,9 @@ function AppInner() {
       </div>
 
       {/* Sidebar */}
-      <div className={cn(
-        'config-panel w-[340px] bg-[#1e1e1e] border-l border-white/10 overflow-y-auto transition-all duration-300 ease-in-out shrink-0 flex flex-col',
-        isSidebarOpen ? 'translate-x-0' : 'translate-x-full hidden'
-      )}>
+      <div className={cn('config-panel w-[340px] bg-[#1e1e1e] border-l border-white/10 overflow-y-auto transition-all duration-300 ease-in-out shrink-0 flex flex-col', isSidebarOpen ? 'translate-x-0' : 'translate-x-full hidden')}>
         <div className="p-4 border-b border-white/10 shrink-0">
-          <h2 className="text-sm font-semibold text-gray-200 flex items-center gap-2">
-            <Settings className="w-4 h-4" />
-            CONFIGURAÇÕES
-          </h2>
+          <h2 className="text-sm font-semibold text-gray-200 flex items-center gap-2"><Settings className="w-4 h-4" />CONFIGURAÇÕES</h2>
         </div>
         <div className="p-4 space-y-2 flex-1 overflow-y-auto">
 
@@ -650,48 +397,33 @@ function AppInner() {
             <div className="space-y-4">
               <div className="space-y-2">
                 <label className="text-xs text-gray-400">Seletor de modelo</label>
-                <select value={model} onChange={(e) => setModel(e.target.value)}
-                  disabled={isConnected}
+                <select value={model} onChange={e => setModel(e.target.value)} disabled={isConnected}
                   className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:opacity-50">
                   <optgroup label="── Live (voz nativa) ──">
                     <option value="gemini-2.5-flash-native-audio-preview-12-2025">gemini-2.5-flash-native-audio...</option>
                   </optgroup>
-                  <optgroup label="── Texto + STT + TTS ──">
+                  <optgroup label="── Texto + STT + Inworld TTS ──">
                     <option value="gemini-3.1-flash-lite-preview">gemini-3.1-flash-lite-preview</option>
                     <option value="gemini-2.5-flash">gemini-2.5-flash</option>
                     <option value="gemini-2.5-pro-preview-06-05">gemini-2.5-pro-preview</option>
                   </optgroup>
                 </select>
-                {isConnected && (
-                  <p className="text-[10px] text-gray-500">Encerre a sessão para trocar o modelo.</p>
-                )}
-                <div className={cn(
-                  'text-[10px] px-2 py-1 rounded font-medium',
-                  activeMode === 'live'
-                    ? 'bg-purple-500/10 text-purple-400'
-                    : 'bg-cyan-500/10 text-cyan-400'
-                )}>
-                  {activeMode === 'live'
-                    ? '⚡ Modo Live — WebSocket + voz nativa Gemini'
-                    : '💬 Modo Texto — Chrome STT + REST + TTS navegador'}
+                {isConnected && <p className="text-[10px] text-gray-500">Encerre a sessão para trocar o modelo.</p>}
+                <div className={cn('text-[10px] px-2 py-1 rounded font-medium', activeMode === 'live' ? 'bg-purple-500/10 text-purple-400' : 'bg-cyan-500/10 text-cyan-400')}>
+                  {activeMode === 'live' ? '⚡ Modo Live — WebSocket + voz nativa Gemini' : '💬 Modo Texto — Chrome STT + REST + Inworld TTS'}
                 </div>
               </div>
-
               <ToggleRow label="Thinking mode" checked={thinkingMode} onChange={setThinkingMode} />
               <div className="space-y-2">
-                <div className="flex justify-between text-xs">
-                  <span className="text-gray-200">Thinking budget</span>
-                  <span className="text-gray-400">{thinkingBudget}</span>
-                </div>
-                <input type="range" min="0" max="8000" step="100" value={thinkingBudget}
-                  onChange={(e) => setThinkingBudget(parseInt(e.target.value))} className="w-full" />
+                <div className="flex justify-between text-xs"><span className="text-gray-200">Thinking budget</span><span className="text-gray-400">{thinkingBudget}</span></div>
+                <input type="range" min="0" max="8000" step="100" value={thinkingBudget} onChange={e => setThinkingBudget(parseInt(e.target.value))} className="w-full" />
               </div>
               <ToggleRow label="Affective dialog" checked={affectiveDialog} onChange={setAffectiveDialog} />
               <ToggleRow label="Proactive audio" checked={proactiveAudio} onChange={setProactiveAudio} />
               <ToggleRow label="Turn coverage" checked={turnCoverage} onChange={setTurnCoverage} />
               <div className="space-y-2">
                 <label className="text-xs text-gray-400">Media resolution</label>
-                <select value={mediaResolution} onChange={(e) => setMediaResolution(e.target.value)}
+                <select value={mediaResolution} onChange={e => setMediaResolution(e.target.value)}
                   className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500">
                   <option value="258 tokens / image">258 tokens / image</option>
                   <option value="High">High</option>
@@ -707,7 +439,7 @@ function AppInner() {
                   <div className="space-y-2">
                     <label className="text-xs text-gray-400">Seletor de voz (Live)</label>
                     <div className="relative">
-                      <select value={voice} onChange={(e) => setVoice(e.target.value)}
+                      <select value={voice} onChange={e => setVoice(e.target.value)}
                         className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500">
                         <option value="Zephyr">Zephyr (Brilhante)</option>
                         <option value="Puck">Puck (Upbeat)</option>
@@ -726,60 +458,100 @@ function AppInner() {
                   <ToggleRow label="Play Audio" checked={playAudio} onChange={setPlayAudio} />
                 </>
               ) : (
-                <>
-                  <p className="text-xs text-gray-500">Modo Texto usa as vozes instaladas no sistema/browser.</p>
-                  <ToggleRow label="TTS habilitado" checked={ttsEnabled} onChange={setTtsEnabled} />
+                <div className="space-y-4">
+                  {/* TTS habilitado */}
+                  <ToggleRow label="TTS habilitado (Inworld)" checked={ttsEnabled} onChange={setTtsEnabled} />
+
+                  {/* Motor TTS */}
                   <div className="space-y-2">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-gray-200">Velocidade da fala</span>
-                      <span className="text-gray-400">{ttsRate.toFixed(1)}x</span>
-                    </div>
-                    <input type="range" min="0.5" max="2" step="0.1" value={ttsRate}
-                      onChange={(e) => setTtsRate(parseFloat(e.target.value))} className="w-full" />
+                    <label className="text-xs text-gray-400">Motor TTS</label>
+                    <select value={ttsModel} onChange={e => setTtsModelState(e.target.value as TTSModel)}
+                      className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500">
+                      <option value="inworld-tts-1.5-mini">🚀 Mini (Rápido)</option>
+                      <option value="inworld-tts-1.5-max">💎 Max (Qualidade)</option>
+                    </select>
                   </div>
-                </>
+
+                  {/* Secret Key */}
+                  <div className="space-y-2">
+                    <label className="text-xs text-gray-400">API Secret Key</label>
+                    <input
+                      type="password"
+                      value={ttsSecretKey}
+                      onChange={e => setTtsSecretKey(e.target.value)}
+                      placeholder="Sua chave da apitts.ghost1.cloud"
+                      className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                  </div>
+
+                  {/* Voice ID + botão listar */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs text-gray-400">Voz</label>
+                      <button
+                        onClick={handleListVoices}
+                        disabled={loadingVoices || !ttsSecretKey}
+                        className="flex items-center gap-1 text-[10px] px-2 py-1 rounded bg-blue-500/10 text-blue-400 hover:bg-blue-500/20 disabled:opacity-40 transition-colors"
+                      >
+                        {loadingVoices ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                        Listar vozes
+                      </button>
+                    </div>
+
+                    {voicesError && <p className="text-[10px] text-red-400">{voicesError}</p>}
+
+                    {availableVoices.length > 0 ? (
+                      <select
+                        value={ttsVoiceId}
+                        onChange={e => setTtsVoiceId(e.target.value)}
+                        className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 appearance-none focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      >
+                        {availableVoices.map(v => (
+                          <option key={v.voiceId} value={v.voiceId}>
+                            {v.displayName || v.voiceId} {v.languageCode ? `(${v.languageCode})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="text"
+                        value={ttsVoiceId}
+                        onChange={e => setTtsVoiceId(e.target.value)}
+                        placeholder="Voice ID manual"
+                        className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      />
+                    )}
+                    <p className="text-[10px] text-gray-600">Insira a Secret Key e clique em 'Listar vozes' para ver as opções disponíveis.</p>
+                  </div>
+                </div>
               )}
             </div>
           </CollapsibleSection>
 
           <CollapsibleSection title="🧠 CONTEXTO" defaultOpen>
             <div className="space-y-3">
-              <ToggleRow
-                label="Usar contexto de conversas anteriores"
-                checked={useConversationContext}
-                onChange={setUseConversationContext}
-              />
-              <p className="text-xs text-gray-500">
-                Quando ativo, injeta as últimas mensagens do histórico no system instruction ao conectar.
-              </p>
+              <ToggleRow label="Usar contexto de conversas anteriores" checked={useConversationContext} onChange={setUseConversationContext} />
+              <p className="text-xs text-gray-500">Quando ativo, injeta as últimas mensagens do histórico no system instruction ao conectar.</p>
             </div>
           </CollapsibleSection>
 
           <CollapsibleSection title="📋 INSTRUCTIONS" defaultOpen>
             <div className="space-y-3">
               <div className="space-y-2">
-                {instructions.map((inst) => (
+                {instructions.map(inst => (
                   <div key={inst.id} className="flex items-center justify-between group/item p-2 hover:bg-white/5 rounded-lg transition-colors">
                     <label className="flex items-center gap-3 cursor-pointer flex-1 min-w-0">
-                      <input type="radio" name="instruction" checked={activeInstructionId === inst.id}
-                        onChange={() => setActiveInstructionId(inst.id)} className="shrink-0" />
+                      <input type="radio" name="instruction" checked={activeInstructionId === inst.id} onChange={() => setActiveInstructionId(inst.id)} className="shrink-0" />
                       <span className="text-sm text-gray-200 truncate">{inst.name}</span>
                     </label>
                     <div className="flex items-center gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity shrink-0">
-                      <button onClick={() => setEditingInstruction(inst)}
-                        className="p-1.5 text-gray-400 hover:text-blue-400 hover:bg-blue-400/10 rounded">
-                        <Edit2 className="w-3.5 h-3.5" />
-                      </button>
-                      <button onClick={() => setInstructions((prev) => prev.filter((i) => i.id !== inst.id))}
-                        className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-400/10 rounded">
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      <button onClick={() => setEditingInstruction(inst)} className="p-1.5 text-gray-400 hover:text-blue-400 hover:bg-blue-400/10 rounded"><Edit2 className="w-3.5 h-3.5" /></button>
+                      <button onClick={() => setInstructions(prev => prev.filter(i => i.id !== inst.id))} className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-400/10 rounded"><Trash2 className="w-3.5 h-3.5" /></button>
                     </div>
                   </div>
                 ))}
               </div>
-              <button
-                onClick={() => setEditingInstruction({ id: 'uuid_' + Date.now(), name: 'Nova Instruction', text: '' })}
+              <button onClick={() => setEditingInstruction({ id: 'uuid_' + Date.now(), name: 'Nova Instruction', text: '' })}
                 className="w-full py-2 flex items-center justify-center gap-2 text-sm text-blue-400 hover:bg-blue-400/10 rounded-lg transition-colors border border-blue-400/20 border-dashed">
                 <Plus className="w-4 h-4" /> Nova Instruction
               </button>
@@ -792,25 +564,15 @@ function AppInner() {
                 {history.length === 0 ? (
                   <p className="text-center text-gray-500 text-xs py-4 italic">Nenhuma sessão salva.</p>
                 ) : (
-                  history.map((session) => (
+                  history.map(session => (
                     <div key={session.id} className="flex items-center justify-between group/item p-2 hover:bg-white/5 rounded-lg transition-colors text-xs">
                       <div className="flex flex-col min-w-0 flex-1">
                         <span className="text-gray-300 truncate">{new Date(session.startedAt).toLocaleString()}</span>
-                        <span className="text-gray-500 truncate">
-                          {session.wasDropped && '⚡ '}
-                          {session.mode === 'text' && '💬 '}
-                          {session.instruction} · {session.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')).length} msgs
-                        </span>
+                        <span className="text-gray-500 truncate">{session.wasDropped && '⚡ '}{session.mode === 'text' && '💬 '}{session.instruction} · {session.messages.filter(m => !m.isThinking && (m.role === 'user' || m.role === 'model')).length} msgs</span>
                       </div>
                       <div className="flex items-center gap-1 opacity-0 group-hover/item:opacity-100 transition-opacity shrink-0 ml-2">
-                        <button onClick={() => setViewingSession(session)}
-                          className="p-1.5 text-gray-400 hover:text-blue-400 hover:bg-blue-400/10 rounded">
-                          <Eye className="w-3.5 h-3.5" />
-                        </button>
-                        <button onClick={() => setHistory((prev) => prev.filter((s) => s.id !== session.id))}
-                          className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-400/10 rounded">
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        <button onClick={() => setViewingSession(session)} className="p-1.5 text-gray-400 hover:text-blue-400 hover:bg-blue-400/10 rounded"><Eye className="w-3.5 h-3.5" /></button>
+                        <button onClick={() => setHistory(prev => prev.filter(s => s.id !== session.id))} className="p-1.5 text-gray-400 hover:text-red-400 hover:bg-red-400/10 rounded"><Trash2 className="w-3.5 h-3.5" /></button>
                       </div>
                     </div>
                   ))
@@ -818,40 +580,9 @@ function AppInner() {
               </div>
               {history.length > 0 && (
                 <div className="flex gap-2 pt-2 border-t border-white/10">
-                  <button onClick={() => {
-                    const blob = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' });
-                    const a = document.createElement('a');
-                    a.href = URL.createObjectURL(blob);
-                    a.download = `livego_history_${Date.now()}.json`;
-                    a.click();
-                  }} className="flex-1 py-1.5 flex items-center justify-center gap-1.5 text-xs text-gray-300 hover:bg-white/10 rounded transition-colors">
-                    <Download className="w-3.5 h-3.5" /> JSON
-                  </button>
-                  <button onClick={() => {
-                    let txt = '';
-                    for (const sess of history) {
-                      txt += `\n${'='.repeat(60)}\nSESSÃO: ${sess.startedAt}\nModelo: ${sess.model} | Modo: ${sess.mode || 'live'}\nInstruction: ${sess.instruction}\n${'='.repeat(60)}\n\n`;
-                      for (const msg of sess.messages) {
-                        if (msg.isThinking) continue;
-                        txt += `${msg.role.toUpperCase()}: ${msg.text}\n`;
-                      }
-                    }
-                    const blob = new Blob([txt], { type: 'text/plain' });
-                    const a = document.createElement('a');
-                    a.href = URL.createObjectURL(blob);
-                    a.download = `livego_history_${Date.now()}.txt`;
-                    a.click();
-                  }} className="flex-1 py-1.5 flex items-center justify-center gap-1.5 text-xs text-gray-300 hover:bg-white/10 rounded transition-colors">
-                    <Download className="w-3.5 h-3.5" /> TXT
-                  </button>
-                  <button onClick={() => {
-                    if (confirm('Tem certeza que deseja limpar todo o histórico?')) {
-                      setHistory([]);
-                      localStorage.removeItem('livego_history');
-                    }
-                  }} className="flex-1 py-1.5 flex items-center justify-center gap-1.5 text-xs text-red-400 hover:bg-red-400/10 rounded transition-colors">
-                    <Trash2 className="w-3.5 h-3.5" /> Limpar
-                  </button>
+                  <button onClick={() => { const b = new Blob([JSON.stringify(history, null, 2)], { type: 'application/json' }); const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = `livego_history_${Date.now()}.json`; a.click(); }} className="flex-1 py-1.5 flex items-center justify-center gap-1.5 text-xs text-gray-300 hover:bg-white/10 rounded transition-colors"><Download className="w-3.5 h-3.5" /> JSON</button>
+                  <button onClick={() => { let txt = ''; for (const s of history) { txt += `\n${'='.repeat(60)}\nSESSÃO: ${s.startedAt}\nModelo: ${s.model} | Modo: ${s.mode || 'live'}\nInstruction: ${s.instruction}\n${'='.repeat(60)}\n\n`; for (const m of s.messages) { if (m.isThinking) continue; txt += `${m.role.toUpperCase()}: ${m.text}\n`; } } const b = new Blob([txt], { type: 'text/plain' }); const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = `livego_history_${Date.now()}.txt`; a.click(); }} className="flex-1 py-1.5 flex items-center justify-center gap-1.5 text-xs text-gray-300 hover:bg-white/10 rounded transition-colors"><Download className="w-3.5 h-3.5" /> TXT</button>
+                  <button onClick={() => { if (confirm('Limpar todo o histórico?')) { setHistory([]); localStorage.removeItem('livego_history'); } }} className="flex-1 py-1.5 flex items-center justify-center gap-1.5 text-xs text-red-400 hover:bg-red-400/10 rounded transition-colors"><Trash2 className="w-3.5 h-3.5" /> Limpar</button>
                 </div>
               )}
             </div>
@@ -864,36 +595,22 @@ function AppInner() {
         <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-[#1e1e1e] border border-white/10 rounded-xl w-full max-w-lg shadow-2xl flex flex-col max-h-[90vh]">
             <div className="p-4 border-b border-white/10 flex items-center justify-between shrink-0">
-              <h3 className="text-lg font-medium text-gray-200">
-                {instructions.find((i) => i.id === editingInstruction.id) ? 'Editar Instruction' : 'Nova Instruction'}
-              </h3>
+              <h3 className="text-lg font-medium text-gray-200">{instructions.find(i => i.id === editingInstruction.id) ? 'Editar Instruction' : 'Nova Instruction'}</h3>
               <button onClick={() => setEditingInstruction(null)} className="text-gray-400 hover:text-gray-200">✕</button>
             </div>
             <div className="p-4 space-y-4 overflow-y-auto flex-1">
               <div className="space-y-2">
                 <label className="text-sm text-gray-400">Nome</label>
-                <input type="text" value={editingInstruction.name}
-                  onChange={(e) => setEditingInstruction({ ...editingInstruction, name: e.target.value })}
-                  className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500" />
+                <input type="text" value={editingInstruction.name} onChange={e => setEditingInstruction({ ...editingInstruction, name: e.target.value })} className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500" />
               </div>
               <div className="space-y-2 flex-1 flex flex-col">
                 <label className="text-sm text-gray-400">System Instruction</label>
-                <textarea value={editingInstruction.text}
-                  onChange={(e) => setEditingInstruction({ ...editingInstruction, text: e.target.value })}
-                  className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500 min-h-[200px] flex-1 resize-none" />
+                <textarea value={editingInstruction.text} onChange={e => setEditingInstruction({ ...editingInstruction, text: e.target.value })} className="w-full bg-[#2a2a2a] border border-white/5 rounded-lg px-3 py-2 text-sm text-gray-200 focus:outline-none focus:ring-1 focus:ring-blue-500 min-h-[200px] flex-1 resize-none" />
               </div>
             </div>
             <div className="p-4 border-t border-white/10 flex justify-end gap-2 shrink-0">
               <button onClick={() => setEditingInstruction(null)} className="px-4 py-2 text-sm text-gray-400 hover:text-gray-200">Cancelar</button>
-              <button onClick={() => {
-                setInstructions((prev) => {
-                  const exists = prev.find((i) => i.id === editingInstruction.id);
-                  if (exists) return prev.map((i) => i.id === editingInstruction.id ? editingInstruction : i);
-                  return [...prev, editingInstruction];
-                });
-                if (!activeInstructionId) setActiveInstructionId(editingInstruction.id);
-                setEditingInstruction(null);
-              }} className="px-4 py-2 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors">Salvar</button>
+              <button onClick={() => { setInstructions(prev => { const exists = prev.find(i => i.id === editingInstruction.id); if (exists) return prev.map(i => i.id === editingInstruction.id ? editingInstruction : i); return [...prev, editingInstruction]; }); if (!activeInstructionId) setActiveInstructionId(editingInstruction.id); setEditingInstruction(null); }} className="px-4 py-2 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded-lg transition-colors">Salvar</button>
             </div>
           </div>
         </div>
@@ -912,19 +629,9 @@ function AppInner() {
             </div>
             <div className="p-4 overflow-y-auto flex-1 space-y-4">
               {viewingSession.messages.map((msg, i) => (
-                <div key={i} className={cn(
-                  'p-3 rounded-lg max-w-[85%]',
-                  msg.role === 'user' ? 'bg-blue-500/10 ml-auto' : 'bg-white/5',
-                  msg.isThinking && 'opacity-70 border border-dashed border-white/10'
-                )}>
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className="text-xs font-medium text-gray-400 uppercase tracking-wider">
-                      {msg.role} {msg.isThinking && '(Thinking)'}
-                    </span>
-                  </div>
-                  <div className={cn('text-sm whitespace-pre-wrap', msg.isThinking ? 'text-gray-400 font-mono text-xs' : 'text-gray-200')}>
-                    {msg.text}
-                  </div>
+                <div key={i} className={cn('p-3 rounded-lg max-w-[85%]', msg.role === 'user' ? 'bg-blue-500/10 ml-auto' : 'bg-white/5', msg.isThinking && 'opacity-70 border border-dashed border-white/10')}>
+                  <div className="flex items-center gap-2 mb-1"><span className="text-xs font-medium text-gray-400 uppercase tracking-wider">{msg.role} {msg.isThinking && '(Thinking)'}</span></div>
+                  <div className={cn('text-sm whitespace-pre-wrap', msg.isThinking ? 'text-gray-400 font-mono text-xs' : 'text-gray-200')}>{msg.text}</div>
                 </div>
               ))}
             </div>
@@ -940,11 +647,7 @@ function CollapsibleSection({ title, children, defaultOpen = false }: { title: s
     <details className="group border-b border-white/10 pb-2" open={defaultOpen}>
       <summary className="section-header list-none -mx-2 rounded-lg">
         <h3 className="text-sm font-medium text-gray-200 tracking-wide">{title}</h3>
-        <span className="chevron">
-          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
-            <path d="M2 4L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </span>
+        <span className="chevron"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 4L6 8L10 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></span>
       </summary>
       <div className="pt-2 pb-4 space-y-4">{children}</div>
     </details>
@@ -953,9 +656,7 @@ function CollapsibleSection({ title, children, defaultOpen = false }: { title: s
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (c: boolean) => void }) {
   return (
-    <button
-      onClick={() => onChange(!checked)}
-      className={cn('w-10 h-5 rounded-full transition-colors relative', checked ? 'bg-[#7c5cfc]' : 'bg-[#3a3a3a]')}>
+    <button onClick={() => onChange(!checked)} className={cn('w-10 h-5 rounded-full transition-colors relative', checked ? 'bg-[#7c5cfc]' : 'bg-[#3a3a3a]')}>
       <div className={cn('absolute top-0.5 left-0.5 w-4 h-4 rounded-full transition-transform', checked ? 'translate-x-5 bg-white' : 'translate-x-0 bg-gray-400')} />
     </button>
   );
